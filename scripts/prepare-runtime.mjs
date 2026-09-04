@@ -182,6 +182,39 @@ function createRuntimeTar() {
   log(`node-runtime.tar 生成完毕（${(statSync(TAR_PATH).size / 1024 / 1024).toFixed(1)} MB）`);
 }
 
+/** 安装异常诊断：打印 npm 全局 prefix 与关键目录内容，便于 CI 排障 */
+function dumpDshDiagnostics() {
+  try {
+    const prefix = execFileSync(NODE_EXE, [NPM_CLI, 'prefix', '-g'], {
+      cwd: RUNTIME_DIR,
+      encoding: 'utf8',
+    }).trim();
+    log(`诊断：npm 全局 prefix = ${prefix}`);
+  } catch (err) {
+    log(`诊断：npm prefix 查询失败：${err.message}`);
+  }
+  const list = (label, dir) => {
+    try {
+      const names = readdirSync(dir);
+      log(`诊断：${label}（${names.length} 项）：${names.slice(0, 40).join(', ')}${names.length > 40 ? ' …' : ''}`);
+    } catch (err) {
+      log(`诊断：${label} 不可读：${err.message}`);
+    }
+  };
+  list('node_modules', join(RUNTIME_DIR, 'node_modules'));
+  list('@deepseek-ai', join(RUNTIME_DIR, 'node_modules', '@deepseek-ai'));
+  list('dsh', join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh'));
+  const pkgPath = join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'package.json');
+  if (existsSync(pkgPath)) {
+    try {
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
+      log(`诊断：dsh package.json version=${pkg.version} bin=${JSON.stringify(pkg.bin)}`);
+    } catch (err) {
+      log(`诊断：dsh package.json 解析失败：${err.message}`);
+    }
+  }
+}
+
 /** 用系统 tar（bsdtar）交叉校验：条目数一致 + 最大文件内容逐字节一致 */
 function verifyTar() {
   const { dirs, files } = walkTree(RUNTIME_DIR);
@@ -236,13 +269,23 @@ async function main() {
     log(`内置 Node 就绪：${ver}`);
 
     // 2. 安装锁定版本的 dsh（npm 全局 prefix 即 node.exe 所在目录）
+    const dshInstall = () =>
+      execFileSync(
+        NODE_EXE,
+        [NPM_CLI, 'install', '--global', '--no-audit', '--no-fund', `@deepseek-ai/dsh@${DSH_VERSION}`],
+        { cwd: RUNTIME_DIR, stdio: 'inherit' }
+      );
     log(`安装 @deepseek-ai/dsh@${DSH_VERSION} …`);
-    execFileSync(
-      NODE_EXE,
-      [NPM_CLI, 'install', '--global', '--no-audit', '--no-fund', `@deepseek-ai/dsh@${DSH_VERSION}`],
-      { cwd: RUNTIME_DIR, stdio: 'inherit' }
-    );
-    if (!existsSync(DSH_BIN)) fail('dsh 安装后未找到 lib/bin.js');
+    dshInstall();
+    if (!existsSync(DSH_BIN)) {
+      // CI 曾观测到安装退出码 0 但文件缺失（疑似瞬时问题）：重试一次
+      log('安装后未找到 lib/bin.js，重试一次 …');
+      dshInstall();
+    }
+    if (!existsSync(DSH_BIN)) {
+      dumpDshDiagnostics();
+      fail('dsh 安装后未找到 lib/bin.js（详见上方诊断输出）');
+    }
 
     const dshPkg = JSON.parse(
       readFileSync(join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8')
