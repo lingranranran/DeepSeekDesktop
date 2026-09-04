@@ -7,6 +7,7 @@ out/
 .sandbox-dsh-home/
 resources/node-runtime/
 release/
+release2/
 .DS_Store
 .pnpm-cache/
 .pnpm-store/

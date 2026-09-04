@@ -3,7 +3,7 @@ appId: io.github.deepseek-harness.desktop
 productName: DeepSeek Harness Desktop
 
 directories:
-  output: release
+  output: release2
 
 # 应用自身文件打进 app.asar（dependencies 为空，不会带入 node_modules）
 files:
