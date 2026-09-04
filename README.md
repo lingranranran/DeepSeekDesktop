@@ -8,11 +8,11 @@
 |---|---|
 | 目标平台 | Windows 10+（架构预留跨平台能力） |
 | 技术栈 | Electron · TypeScript · @deepseek-ai/dsh |
-| 适配 dsh 版本 | `0.1.1-rc.2`（截至 2026-09-03，开发者预览） |
-| dsh 运行时 | 内置独立 Node.js ≥ 22.19 运行时，开箱即用 |
+| 适配 dsh 版本 | `0.1.0-rc.6`（版本锁定，随应用发版升级） |
+| dsh 运行时 | 内置 Node.js v22.23.2（22 LTS）+ dsh 0.1.0-rc.6，开箱即用 |
 | 许可证 | MIT |
 
-> **当前状态**：M0（可行性验证）、M1（薄壳 MVP）、M2（健壮性）、M3（桌面集成）已完成并实测通过，处于 M4（打包发布）待开发阶段。安装包尚未发布。
+> **当前状态**：M0（可行性验证）、M1（薄壳 MVP）、M2（健壮性）、M3（桌面集成）、M4（打包发布）均已完成；NSIS 安装包已产出（`release/DeepSeek-Harness-Desktop-Setup-0.1.0.exe`，约 150 MB），待真实环境手动验收。
 > 注意：dsh 处于开发者预览（Developer Preview）阶段，存在破坏性变更，本项目采用版本锁定策略跟随上游。
 
 第三方声明：本项目为社区驱动的开源封装项目，与 DeepSeek AI 官方无隶属关系。
@@ -127,11 +127,12 @@ npx @deepseek-ai/dsh web
 | 决策点 | 选择 | 理由 |
 |---|---|---|
 | 桌面框架 | Electron | 纯 JS/TS 技术栈、生态最成熟、渲染行为与 Chrome 浏览器一致（对 dsh Web UI 的兼容性风险最低） |
-| dsh 集成方式 | 完全内置 | 用户零配置开箱即用；代价是安装包体积增大（约 200MB 量级）与 dsh 升级需随应用发版 |
+| dsh 集成方式 | 完全内置 | 用户零配置开箱即用；代价是安装包体积增大（约 150 MB）与 dsh 升级需随应用发版 |
 | 端口策略 | `--port 0` 随机端口 | 避免与用户已运行的 dsh 实例或其他应用冲突；从子进程 stdout 解析实际端口 |
 | 进程模型 | 独立子进程 spawn | dsh 与桌面壳解耦，任一方崩溃互不传染，升级互不干扰 |
 | 前端策略 | 直接加载 dsh Web UI | 零改动即获得 100% 能力，并自动跟随官方 UI 迭代 |
-| Node 运行时 | 随包分发独立 Node.js（≥ 22.19） | dsh 要求 Node ^22.19 或 ≥ 24；独立运行时与 Electron 内嵌 Node 版本解耦，规避版本漂移风险 |
+| Node 运行时 | 随包分发独立 Node.js v22.23.2（22 LTS） | dsh 要求 Node ^22.19 或 ≥ 24；独立运行时与 Electron 内嵌 Node 版本解耦，规避版本漂移风险 |
+| 安装程序 | NSIS 引导式（oneClick: false） | 支持自定义安装目录；按用户安装无需管理员权限；暂不签名（接受 SmartScreen 提示） |
 
 ### 3.3 启动时序与生命周期
 
@@ -139,10 +140,11 @@ npx @deepseek-ai/dsh web
 
 1. 单实例检查：`app.requestSingleInstanceLock()`，已有实例则聚焦其主窗口后退出
 2. 就绪页：创建窗口并显示轻量加载页（原生渲染，不依赖 dsh）
-3. 拉起服务：以内置 Node 运行时 spawn dsh（`web --port 0 --no-open`）；Windows 下直接以 `node <dsh-bin>.js` 方式调用，绕过 `.cmd` shim，避免 shell 解析问题
-4. 端口发现：解析子进程 stdout 中的 `dsh web: http://127.0.0.1:<port>` 获取实际端口
-5. 加载 UI：`BrowserWindow.loadURL()` 载入 Web UI
-6. 健康守护：周期性健康检查，异常自动重启（上限 3 次），超限显示错误页并给出日志路径
+3. 运行时就绪（v0.1.1+）：首次启动将安装目录内的单文件 `node-runtime.tar`（约 340 MB，内含 Node.js 与 dsh）解压到 `userData/runtime`，加载页实时显示进度；后续启动校验标记直接复用（毫秒级）。解压被意外中断时，下次启动自动检测并完整重做（自愈）
+4. 拉起服务：以内置 Node 运行时 spawn dsh（`web --port 0 --no-open`）；Windows 下直接以 `node <dsh-bin>.js` 方式调用，绕过 `.cmd` shim，避免 shell 解析问题
+5. 端口发现：解析子进程 stdout 中的 `dsh web: http://127.0.0.1:<port>` 获取实际端口
+6. 加载 UI：`BrowserWindow.loadURL()` 载入 Web UI
+7. 健康守护：周期性健康检查，异常自动重启（上限 3 次），超限显示错误页并给出日志路径
 
 **退出（优雅关闭）：**
 
@@ -151,23 +153,32 @@ npx @deepseek-ai/dsh web
 3. 超时（约 5 秒）未退出时，Windows 下以 `taskkill /PID <pid> /T /F` 强制回收整棵进程树
 4. 校验无残留监听端口后结束应用
 
-### 3.4 目录结构（规划）
+### 3.4 目录结构
 
 ```text
 deepseek-harness-desktop/
-├── package.json            # electron、electron-builder、@deepseek-ai/dsh 等依赖
+├── package.json            # electron、electron-builder、typescript 等开发依赖
+├── pnpm-workspace.yaml     # pnpm 11：构建白名单、store/cache 与依赖 override
+├── electron-builder.yml    # NSIS 打包配置（目标、图标、extraResources、卸载清理）
+├── build/
+│   └── installer.nsh       # NSIS 定制：卸载时询问是否清理 userData
+├── scripts/
+│   └── prepare-runtime.mjs # 内置运行时准备脚本（Node zip 下载 + 校验 + 装 dsh + 打 tar）
 ├── electron/
-│   ├── main.ts             # 主进程入口：应用生命周期、单实例锁
+│   ├── main.ts             # 主进程入口：生命周期、单实例锁、设置 IPC、首启解压编排
 │   ├── dsh-manager.ts      # dsh 子进程托管：spawn、端口解析、健康检查、重启
-│   ├── window.ts           # BrowserWindow 创建与窗口状态持久化
+│   ├── runtime-setup.ts    # v0.1.1+：内置运行时 tar 解压（进度回调 + 标记自愈）
 │   ├── tray.ts             # 系统托盘
-│   └── logger.ts          # 日志
-├── preload.ts              # contextBridge（预留给渲染层增强的窄接口）
-├── renderer/               # 桌面端自有 UI（加载页 / 错误页 / 设置页）
+│   ├── settings.ts         # 设置持久化
+│   ├── window-state.ts     # 窗口状态记忆
+│   ├── preload.ts          # contextBridge 窄接口
+│   └── logger.ts           # 日志（按天滚动，保留 7 天）
+├── renderer/               # 桌面端自有 UI（加载页 / 设置页）
 ├── resources/
-│   ├── node-runtime/       # 内置 Node.js 运行时 + @deepseek-ai/dsh + corepack/pnpm
+│   ├── node-runtime/       # 内置 Node v22.23.2 + dsh 0.1.0-rc.6（构建时生成，不入库）
+│   ├── node-runtime.tar    # 单文件分发归档（prepare-runtime 生成，安装包实际携带物，不入库）
 │   └── icons/              # 应用图标
-├── electron-builder.yml    # NSIS 打包配置
+├── release/                # 构建产物（Setup exe / win-unpacked，不入库）
 └── README.md
 ```
 
@@ -187,9 +198,17 @@ deepseek-harness-desktop/
 
 ## 4. 安装指南
 
-### 4.1 用户安装（尚未发布）
+### 4.1 用户安装
 
-安装包尚未发布（项目处于 M0/M1 阶段）。发布后预计提供 NSIS 安装程序（`.exe`），双击安装、开箱即用，无需 Node.js 等任何前置依赖。
+从项目的 `release/` 目录获取 `DeepSeek-Harness-Desktop-Setup-<版本号>.exe`（NSIS 引导式安装程序）：
+
+1. 双击运行安装程序。Windows SmartScreen 可能提示"已保护你的电脑"（因未购买代码签名证书）——点击 **更多信息 → 仍要运行** 即可继续
+2. 选择安装目录（默认 `%LOCALAPPDATA%\Programs\DeepSeek Harness Desktop`，按用户安装无需管理员权限）
+3. 安装完成后自动创建桌面快捷方式与开始菜单项（快捷方式名 **DeepSeek Harness**）
+4. **首次启动**会自动准备运行环境：将内置的 Node.js 与 dsh 解压到用户数据目录（约 1–3 分钟，窗口内有进度条，仅需一次），随后自动进入应用；**之后启动**直接就绪
+5. 无需安装 Node.js 或任何其他前置依赖；卸载经"设置 → 应用"或开始菜单卸载项进行，卸载时可选择是否保留应用数据（保留则重装后无需再次解压运行时）
+
+> dsh 的会话与配置数据存放在 `~/.dsh`，与安装目录无关，卸载/重装应用不会丢失。
 
 ### 4.2 从源码构建与运行
 
@@ -197,7 +216,7 @@ deepseek-harness-desktop/
 
 - Windows 10 及以上
 - Node.js ≥ 22.19（或 ≥ 24），用于开发
-- pnpm 9+（`npm i -g pnpm` 或通过 corepack 启用）
+- pnpm 11+（`npm i -g pnpm` 或通过 corepack 启用）
 - Git
 
 ```bash
@@ -205,28 +224,35 @@ deepseek-harness-desktop/
 git clone https://github.com/<your-org>/deepseek-harness-desktop.git
 cd deepseek-harness-desktop
 
-# 2. 安装依赖
+# 2. 安装依赖（store/cache 已配置在 pnpm-workspace.yaml，指向项目内目录）
 pnpm install
 
-# 3. 开发模式运行（热更新）
+# 3. 准备内置运行时（下载 Node v22.23.2 zip + sha256 校验 + 全局安装 dsh@0.1.0-rc.6
+#    到 resources/node-runtime/；已就绪时自动跳过，--force 强制重建）
+pnpm prepare-runtime
+
+# 4. 开发模式运行（开发模式无内置运行时，回退使用系统 Node 与全局/本地 dsh）
 pnpm dev
 
-# 4. 构建产物
+# 5. 仅编译 TypeScript（输出 dist/）
 pnpm build
 
-# 5. 打包 Windows 安装程序（输出至 dist/）
+# 6. 构建 Windows 安装程序（编译 + 准备运行时 + electron-builder NSIS，
+#    产物输出至 release/：Setup exe、blockmap、win-unpacked 免安装目录）
 pnpm dist
 ```
 
+> **构建细节**：`pnpm dist` 会将 `resources/node-runtime.tar`（prepare-runtime 生成的单文件归档，内含 Node + dsh）作为 extraResources 打入安装包 asar 之外的 `resources\`。v0.1.0 曾直接散装 3 万+ 运行时文件，在 Windows Defender 实时扫描下 NSIS 逐文件解压形似卡死；v0.1.1 起安装只需写入一个大文件（秒级完成），应用首次启动时再解压到 `userData/runtime`（见 [electron/runtime-setup.ts](electron/runtime-setup.ts)）。首次构建会联网下载 Electron 发行包与 NSIS 工具链（约 200 MB，有缓存）。
+>
 > 开发模式下如本机已装有 dsh，注意端口策略：桌面端使用随机端口，不会与你正在运行的 `dsh web`（默认 3080）冲突；两者共享 `~/.dsh` 数据目录。
 
 ## 5. 使用方法
 
-> 以下为 v1 目标行为，随里程碑逐步交付。
+> v1 功能已全部交付（M0–M4）。
 
 ### 5.1 首次启动
 
-1. 双击应用图标启动，后台自动初始化 dsh（首次运行会自动创建 `~/.dsh` 数据目录与 web profile）
+1. 双击应用图标启动。首次启动会自动准备运行环境（解压内置 Node.js 与 dsh，窗口内显示进度，约 1–3 分钟，仅需一次），随后自动初始化 dsh（首次运行会自动创建 `~/.dsh` 数据目录与 web profile）
 2. 进入 Web UI 后打开 **设置 → 模型**，填入 DeepSeek API Key（或 OpenAI 兼容网关地址）
 3. 点击 **选择工作区**，添加并选中你的项目目录（选中工作区前输入框不可用，属 dsh 正常行为）
 4. 发送第一条任务，开始使用
@@ -256,11 +282,11 @@ pnpm dist
 
 | 里程碑 | 内容 | 预估工作量 | 状态 |
 |---|---|---|---|
-| M0 可行性验证 | 本机实测 dsh 启动、stdout 端口协议、健康检查接口、`~/.dsh` 行为 | 0.5–1 天 | 调研完成，待本机实测 |
-| M1 薄壳 MVP | Electron 脚手架、dsh 托管、端口解析、加载页、优雅退出 | 2–3 天 | 待开发 |
-| M2 健壮性 | 健康检查、崩溃自动重启、启动超时错误页、单实例锁、窗口状态记忆、日志系统 | 3–5 天 | 待开发 |
-| M3 桌面集成 | 系统托盘、系统通知、全局快捷键、设置页、开机自启 | 3–5 天 | 待开发 |
-| M4 打包发布 | electron-builder NSIS 打包、内置 Node 运行时与 dsh、图标、版本策略 | 2–3 天 | 待开发 |
+| M0 可行性验证 | 本机实测 dsh 启动、stdout 端口协议、健康检查接口、`~/.dsh` 行为 | 0.5–1 天 | 已完成 |
+| M1 薄壳 MVP | Electron 脚手架、dsh 托管、端口解析、加载页、优雅退出 | 2–3 天 | 已完成 |
+| M2 健壮性 | 健康检查、崩溃自动重启、启动超时错误页、单实例锁、窗口状态记忆、日志系统 | 3–5 天 | 已完成 |
+| M3 桌面集成 | 系统托盘、系统通知、全局快捷键、设置页、开机自启 | 3–5 天 | 已完成 |
+| M4 打包发布 | electron-builder NSIS 打包、内置 Node 运行时与 dsh、图标、版本策略 | 2–3 天 | 已完成（待真实环境手动验收） |
 | 远期方向 | 去端口化的进程内 IPC、macOS / Linux 支持、自动更新 | — | 规划中 |
 
 > 工作量为单人业余开发的预估区间，仅供参考。
@@ -305,7 +331,7 @@ pnpm dist
 
 **Q4：如何升级内置的 dsh？**
 
-dsh 随应用版本一同分发，升级 dsh 即升级应用。由于 dsh 处于开发者预览阶段（存在破坏性变更），本项目采用版本锁定策略，每个应用版本在发布说明中标注适配的 `@deepseek-ai/dsh` 版本。
+dsh 随应用版本一同分发，升级 dsh 即升级应用。由于 dsh 处于开发者预览阶段（存在破坏性变更），本项目采用版本锁定策略：内置版本定义在 `scripts/prepare-runtime.mjs` 的 `DSH_VERSION` 常量（当前 `0.1.0-rc.6`），每个应用版本在发布说明中标注适配的 `@deepseek-ai/dsh` 版本。
 
 **Q5：启动后白屏 / 一直加载怎么办？**
 
@@ -319,9 +345,9 @@ dsh 仅监听 `127.0.0.1`，不暴露局域网；但与本机其他进程共享�
 
 模型接入由 dsh 决定：DeepSeek 官方模型、OpenAI 兼容网关，以及经插件接入的本地模型。桌面端不对此做任何限制。
 
-**Q8：为什么安装包这么大？**
+**Q8：为什么安装包这么大？首次启动为什么还要等一会儿？**
 
-完全内置方案打包了 Electron（Chromium）、独立 Node.js 运行时与 dsh 及其依赖，体积约 200MB 量级。这是"零配置开箱即用"的代价，已在方案选型时确认接受。
+完全内置方案打包了 Electron（Chromium）、独立 Node.js 运行时与 dsh 及其依赖，安装包约 130 MB。安装本身只需数秒（运行时以单文件归档分发）；首次启动会将运行时解压到用户数据目录（约 1–3 分钟，有进度条），之后启动直接就绪。这是"零配置开箱即用"的代价，已在方案选型时确认接受。
 
 **Q9：之后会支持 macOS / Linux 吗？**
 

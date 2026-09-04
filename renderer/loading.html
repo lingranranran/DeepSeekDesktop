@@ -29,10 +29,56 @@
       font-size: 14px;
       color: #a8adbd;
     }
+    /* 首启运行时解压进度（由主进程通过 executeJavaScript 驱动） */
+    .progress {
+      display: none; /* 默认隐藏：二次启动无解压环节，不闪烁 */
+      flex-direction: column;
+      align-items: center;
+      gap: 16px;
+      width: 320px;
+    }
+    .bar {
+      width: 100%;
+      height: 6px;
+      border-radius: 3px;
+      background: #2a2d38;
+      overflow: hidden;
+    }
+    .fill {
+      width: 0%;
+      height: 100%;
+      border-radius: 3px;
+      background: #4f8cff;
+      transition: width 0.2s ease;
+    }
   </style>
 </head>
 <body>
-  <div class="spinner"></div>
-  <div class="label">正在启动 DeepSeek Harness 服务…</div>
+  <div class="spinner" id="spinner"></div>
+  <div class="label" id="mainLabel">正在启动 DeepSeek Harness 服务…</div>
+  <div class="progress" id="progressWrap">
+    <div class="bar"><div class="fill" id="progressFill"></div></div>
+    <div class="label" id="progressLabel">正在准备首次运行环境…</div>
+  </div>
+  <script>
+    // 主进程 → 加载页的唯一契约（contextIsolation 下不暴露任何敏感能力）
+    window.__setRuntimeProgress = function (done, total) {
+      document.getElementById('spinner').style.display = 'none';
+      document.getElementById('mainLabel').style.display = 'none';
+      document.getElementById('progressWrap').style.display = 'flex';
+      var pct = total > 0 ? Math.floor((done / total) * 100) : 0;
+      document.getElementById('progressFill').style.width = pct + '%';
+      document.getElementById('progressLabel').textContent =
+        '正在准备首次运行环境… ' + pct + '%（仅需一次，下次启动将直接就绪）';
+    };
+    window.__setRuntimePhase = function (phase) {
+      if (phase === 'start') {
+        // 解压结束，回到启动服务状态
+        document.getElementById('progressWrap').style.display = 'none';
+        document.getElementById('spinner').style.display = 'block';
+        document.getElementById('mainLabel').style.display = 'block';
+      }
+    };
+  </script>
 </body>
 </html>

@@ -3,7 +3,7 @@ appId: io.github.deepseek-harness.desktop
 productName: DeepSeek Harness Desktop
 
 directories:
-  output: release2
+  output: release
 
 # 应用自身文件打进 app.asar（dependencies 为空，不会带入 node_modules）
 files:
@@ -11,15 +11,15 @@ files:
   - renderer/**
   - resources/icons/**
 
-# 内置运行时（Node 22 LTS + 锁定版本 dsh）放在 asar 外，子进程可直接执行
-# 注意：from 必须是 resources 而非 resources/node-runtime——electron-builder 的
-# 文件过滤器会硬编码排除「from 根级」的 node_modules（filter.js: relative === "node_modules"），
-# 提升 from 后相对路径变为 node-runtime/node_modules，不再触发该排除
+# 内置运行时（Node 22 LTS + 锁定版本 dsh）以单文件 tar 进 extraResources：
+# v0.1.0 曾以 3 万+散文件安装，NSIS 逐文件解压在 Defender 实时扫描下形似卡死；
+# v0.1.1 起只装一个 338MB 的 node-runtime.tar（安装仅需数秒），
+# 应用首次启动时解压到 userData/runtime 并显示进度（见 electron/runtime-setup.ts）
 extraResources:
   - from: resources
     to: .
     filter:
-      - node-runtime/**/*
+      - node-runtime.tar
 
 win:
   target:
@@ -37,3 +37,5 @@ nsis:
   createStartMenuShortcut: true
   shortcutName: DeepSeek Harness
   artifactName: DeepSeek-Harness-Desktop-Setup-${version}.${ext}
+  # 卸载时询问是否清理 userData（内置运行时/日志/设置），见 build/installer.nsh
+  include: build/installer.nsh

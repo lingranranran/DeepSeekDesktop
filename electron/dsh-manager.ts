@@ -14,6 +14,16 @@ export interface DshManagerEvents {
   onLog: (line: string) => void;
 }
 
+/** dsh 管理器构造选项 */
+export interface DshManagerOptions {
+  events?: Partial<DshManagerEvents>;
+  /**
+   * v0.1.1+：首启从 resources/node-runtime.tar 解压出的内置运行时目录
+   * （userData/runtime），解析优先级高于 resources/node-runtime（v0.1.0 旧布局）。
+   */
+  runtimeDir?: string;
+}
+
 /** 从 stdout 解析端口的正则（实测输出：dsh web: http://127.0.0.1:60429） */
 const PORT_LINE_RE = /dsh web: http:\/\/127\.0\.0\.1:(\d+)/;
 
@@ -43,7 +53,7 @@ const RESOURCES_DIR: string | undefined = (
 
 /**
  * dsh 子进程管理器：
- * - 定位本机 node 与 dsh 入口（优先本项目 node_modules，回退全局安装）
+ * - 定位 node 与 dsh 入口（userData/runtime 首启解压目录 → resources 旧布局 → 开发模式回退）
  * - 以随机端口启动 dsh web，解析 stdout 拿到实际端口
  * - 优雅退出：先 taskkill（不带 /F），超时后 taskkill /F 强杀整棵进程树
  */
@@ -55,8 +65,13 @@ export class DshManager {
   private portReject: ((err: Error) => void) | null = null;
   private healthTimer: NodeJS.Timeout | null = null;
   private healthFailures = 0;
+  private readonly events: Partial<DshManagerEvents>;
+  private readonly runtimeDir: string | undefined;
 
-  constructor(private readonly events: Partial<DshManagerEvents> = {}) {}
+  constructor(opts: DshManagerOptions = {}) {
+    this.events = opts.events ?? {};
+    this.runtimeDir = opts.runtimeDir;
+  }
 
   /** dsh 是否已在运行 */
   get running(): boolean {
@@ -244,14 +259,19 @@ export class DshManager {
   /**
    * 解析用于运行 dsh 的 Node 可执行文件：
    * 1. DSH_DESKTOP_NODE_PATH（显式覆盖，测试/特殊部署用）
-   * 2. 打包内置运行时 resources\node-runtime\node.exe（安装版）
-   * 3. 系统 PATH 中的 node（开发模式，即 M0 实测所用的系统 Node）
+   * 2. userData/runtime/node.exe（v0.1.1+：首启从内置 tar 解压出的运行时）
+   * 3. 打包内置 resources\node-runtime\node.exe（v0.1.0 旧布局，兼容过渡）
+   * 4. 系统 PATH 中的 node（开发模式，即 M0 实测所用的系统 Node）
    * 注意：不能用 process.execPath —— 在 Electron 主进程里它是 electron.exe，
    * 且 Electron 内嵌 Node 版本（20.x）低于 dsh 要求（^22.19）。
    */
   private resolveNode(): string {
     const override = process.env.DSH_DESKTOP_NODE_PATH;
     if (override && existsSync(override)) return override;
+    if (this.runtimeDir) {
+      const node = join(this.runtimeDir, 'node.exe');
+      if (existsSync(node)) return node;
+    }
     if (RESOURCES_DIR) {
       const bundled = join(RESOURCES_DIR, 'node-runtime', 'node.exe');
       if (existsSync(bundled)) return bundled;
@@ -261,11 +281,23 @@ export class DshManager {
 
   /**
    * 解析 dsh 的 JS 入口文件路径：
-   * 1. 打包内置 resources\node-runtime\node_modules\@deepseek-ai\dsh（安装版）
-   * 2. 本项目 node_modules（开发模式）
-   * 3. 全局安装位置（开发模式回退）
+   * 1. userData/runtime（v0.1.1+：首启从内置 tar 解压出的运行时）
+   * 2. 打包内置 resources\node-runtime（v0.1.0 旧布局，兼容过渡）
+   * 3. 本项目 node_modules（开发模式）
+   * 4. 全局安装位置（开发模式回退）
    */
   private resolveDshBin(): string | null {
+    if (this.runtimeDir) {
+      const extracted = join(
+        this.runtimeDir,
+        'node_modules',
+        '@deepseek-ai',
+        'dsh',
+        'lib',
+        'bin.js'
+      );
+      if (existsSync(extracted)) return extracted;
+    }
     if (RESOURCES_DIR) {
       const bundled = join(RESOURCES_DIR, 'node-runtime', 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
       if (existsSync(bundled)) return bundled;

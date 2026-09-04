@@ -6,8 +6,8 @@ out/
 .eb-cache/
 .sandbox-dsh-home/
 resources/node-runtime/
-release/
-release2/
+resources/node-runtime.tar
+release*/
 .DS_Store
 .pnpm-cache/
 .pnpm-store/

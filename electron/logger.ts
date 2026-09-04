@@ -29,13 +29,17 @@ export class Logger {
     this.write('INFO', message);
   }
 
+  warn(message: string): void {
+    this.write('WARN', message);
+  }
+
   error(message: string): void {
     this.write('ERROR', message);
   }
 
   // ---------- 内部 ----------
 
-  private write(level: 'INFO' | 'ERROR', message: string): void {
+  private write(level: 'INFO' | 'WARN' | 'ERROR', message: string): void {
     const line = `[${new Date().toISOString()}] [${level}] ${message.replace(/\r?\n/g, ' ')}\n`;
     // 文件写失败不应影响主流程，静默忽略（如无写权限的环境）
     try {

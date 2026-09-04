@@ -2,13 +2,15 @@
  * 准备内置运行时（M4 打包用）：
  * 1. 下载 Node.js v22.23.2 win-x64 zip，校验 sha256 后解压到 resources/node-runtime/
  * 2. 用内置 npm 安装锁定版本的 @deepseek-ai/dsh 到同一运行时
+ * 3. 将整个运行时打包为单文件 resources/node-runtime.tar（v0.1.1+ 分发方式：
+ *    安装包只需写一个大文件，安装秒级完成；应用首次启动解压到 userData 并显示进度）
  *
- * 幂等：node.exe 与 dsh 均已就位时跳过；--force 可删除后重建。
+ * 幂等：运行时就绪且 tar 存在时跳过；--force 可删除后重建。
  * 用法：node scripts/prepare-runtime.mjs [--force]
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -20,6 +22,9 @@ const RUNTIME_DIR = join(ROOT, 'resources', 'node-runtime');
 const NODE_EXE = join(RUNTIME_DIR, 'node.exe');
 const NPM_CLI = join(RUNTIME_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js');
 const DSH_BIN = join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
+
+/** 单文件分发归档（electron-builder extraResources 只携带它） */
+const TAR_PATH = join(ROOT, 'resources', 'node-runtime.tar');
 
 const NODE_URL = `https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-win-x64.zip`;
 const SHASUMS_URL = `https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt`;
@@ -80,49 +85,178 @@ function extract() {
   rmSync(ZIP_PATH, { force: true });
 }
 
+// ---------- 单文件 tar 打包（v0.1.1+ 分发方式） ----------
+// 安装包只携带一个 node-runtime.tar：NSIS 安装时写一个大文件即可（秒级完成，无逐文件
+// 解压 + 杀软扫描的"假死"观感），应用首次启动再解压到 userData/runtime 并显示进度。
+// 格式：ustar + GNU longname；首条目 .runtime-meta 存储 {id, files, dirs}，
+// 应用侧据此判断是否需要重新解压（升级/损坏自愈）并计算进度分母。
+
+const BLOCK = 512;
+
+/** 运行时标识：内容变化（Node/dsh 版本、打包格式）时随之变化，驱动应用侧重新解压 */
+const RUNTIME_ID = `runtime-v1-node${NODE_VERSION}-dsh${DSH_VERSION}`;
+
+function octalField(value, len) {
+  return Buffer.from(`${value.toString(8).padStart(len - 1, '0')}\0`, 'ascii');
+}
+
+/** 构造 512 字节 ustar 头（POSIX ustar，checksum 按规范计算） */
+function tarHeader({ name, size, typeflag, mode = 0o644, mtime = 0 }) {
+  const h = Buffer.alloc(BLOCK);
+  h.write(name.slice(0, 100), 0, 100, 'utf8');
+  octalField(mode, 8).copy(h, 100); // mode
+  octalField(0, 8).copy(h, 108); // uid
+  octalField(0, 8).copy(h, 116); // gid
+  octalField(size, 12).copy(h, 124); // size
+  octalField(mtime, 12).copy(h, 136); // mtime
+  h.write('        ', 148, 8, 'ascii'); // checksum 先以空格占位
+  h.write(typeflag, 156, 1, 'ascii');
+  h.write('ustar\0', 257, 6, 'ascii');
+  h.write('00', 263, 2, 'ascii');
+  let sum = 0;
+  for (const b of h) sum += b;
+  h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'ascii');
+  return h;
+}
+
+/** 递归收集相对路径（POSIX 分隔符）；遇到符号链接等非常规文件直接失败（tar 分发不支持） */
+function walkTree(root) {
+  const dirs = [];
+  const files = [];
+  const visit = (rel) => {
+    const abs = rel ? join(root, rel) : root;
+    for (const ent of readdirSync(abs, { withFileTypes: true })) {
+      const relPath = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        dirs.push(relPath);
+        visit(relPath);
+      } else if (ent.isFile()) {
+        files.push(relPath);
+      } else {
+        fail(`node-runtime 中存在非常规文件（符号链接等），tar 分发不支持：${relPath}`);
+      }
+    }
+  };
+  visit('');
+  dirs.sort();
+  files.sort();
+  return { dirs, files };
+}
+
+/** 生成 node-runtime.tar（确定性输出：同内容产出同字节，便于比对与排障） */
+function createRuntimeTar() {
+  const { dirs, files } = walkTree(RUNTIME_DIR);
+  log(`打包 node-runtime.tar：${files.length} 文件 / ${dirs.length} 目录 …`);
+  const fd = openSync(TAR_PATH, 'w');
+  try {
+    const writeEntry = (name, data, typeflag, mode) => {
+      const size = data ? data.length : 0;
+      // 超长路径：先写 GNU longname 条目，再写真实条目（名字可为截断占位）
+      if (Buffer.byteLength(name, 'utf8') > 99) {
+        const long = Buffer.from(`${name}\0`, 'utf8');
+        writeSync(fd, tarHeader({ name: '././@LongLink', size: long.length, typeflag: 'L' }));
+        writeSync(fd, long);
+        const pad1 = (BLOCK - (long.length % BLOCK)) % BLOCK;
+        if (pad1) writeSync(fd, Buffer.alloc(pad1));
+      }
+      writeSync(fd, tarHeader({ name, size, typeflag, mode }));
+      if (size > 0) {
+        writeSync(fd, data);
+        const pad2 = (BLOCK - (size % BLOCK)) % BLOCK;
+        if (pad2) writeSync(fd, Buffer.alloc(pad2));
+      }
+    };
+
+    // 首条目：元信息（应用侧读取 id 与总量，无需遍历归档）
+    const meta = Buffer.from(
+      JSON.stringify({ id: RUNTIME_ID, files: files.length, dirs: dirs.length }),
+      'utf8'
+    );
+    writeEntry('.runtime-meta', meta, '0', 0o444);
+    for (const d of dirs) writeEntry(d, null, '5', 0o755);
+    for (const f of files) writeEntry(f, readFileSync(join(RUNTIME_DIR, f)), '0', 0o644);
+    writeSync(fd, Buffer.alloc(BLOCK * 2)); // 归档结束标记（两个全零块）
+  } finally {
+    closeSync(fd);
+  }
+  log(`node-runtime.tar 生成完毕（${(statSync(TAR_PATH).size / 1024 / 1024).toFixed(1)} MB）`);
+}
+
+/** 用系统 tar（bsdtar）交叉校验：条目数一致 + 最大文件内容逐字节一致 */
+function verifyTar() {
+  const { dirs, files } = walkTree(RUNTIME_DIR);
+  const listing = execFileSync('tar.exe', ['-tf', TAR_PATH], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const expected = 1 + dirs.length + files.length; // meta + 目录 + 文件
+  if (listing.length !== expected) {
+    fail(`tar 校验失败：条目数 ${listing.length} ≠ 期望 ${expected}`);
+  }
+  // 抽样：node.exe（最大文件）内容逐字节比对
+  const probe = files.includes('node.exe') ? 'node.exe' : files[0];
+  const original = readFileSync(join(RUNTIME_DIR, probe));
+  const extracted = execFileSync('tar.exe', ['-xOf', TAR_PATH, probe], {
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  if (!original.equals(extracted)) fail(`tar 内容校验失败：${probe} 与源不一致`);
+  log(`tar 校验通过（${expected} 条目，抽查 ${probe}）`);
+}
+
 async function main() {
   const force = process.argv.includes('--force');
   if (force && existsSync(RUNTIME_DIR)) {
     log('--force：删除现有 node-runtime …');
     rmSync(RUNTIME_DIR, { recursive: true, force: true });
   }
+
   if (isReady()) {
-    log('内置运行时已就绪，跳过（--force 可重建）');
-    return;
-  }
-  mkdirSync(RUNTIME_DIR, { recursive: true });
-
-  // 1. 下载 Node zip（已存在则复用）
-  if (!existsSync(ZIP_PATH)) {
-    log(`下载 ${NODE_URL} …`);
-    execFileSync(
-      'curl.exe',
-      ['--fail', '--location', '--output', ZIP_PATH, '--silent', '--show-error', NODE_URL],
-      { stdio: 'inherit' }
-    );
+    log('内置运行时已就绪，跳过下载与安装（--force 可重建）');
   } else {
-    log('已存在下载缓存 zip，跳过下载');
+    mkdirSync(RUNTIME_DIR, { recursive: true });
+
+    // 1. 下载 Node zip（已存在则复用）
+    if (!existsSync(ZIP_PATH)) {
+      log(`下载 ${NODE_URL} …`);
+      execFileSync(
+        'curl.exe',
+        ['--fail', '--location', '--output', ZIP_PATH, '--silent', '--show-error', NODE_URL],
+        { stdio: 'inherit' }
+      );
+    } else {
+      log('已存在下载缓存 zip，跳过下载');
+    }
+    verifyZip();
+    extract();
+
+    if (!existsSync(NODE_EXE)) fail('解压后未找到 node.exe');
+    const ver = execFileSync(NODE_EXE, ['-v'], { encoding: 'utf8' }).trim();
+    log(`内置 Node 就绪：${ver}`);
+
+    // 2. 安装锁定版本的 dsh（npm 全局 prefix 即 node.exe 所在目录）
+    log(`安装 @deepseek-ai/dsh@${DSH_VERSION} …`);
+    execFileSync(
+      NODE_EXE,
+      [NPM_CLI, 'install', '--global', '--no-audit', '--no-fund', `@deepseek-ai/dsh@${DSH_VERSION}`],
+      { cwd: RUNTIME_DIR, stdio: 'inherit' }
+    );
+    if (!existsSync(DSH_BIN)) fail('dsh 安装后未找到 lib/bin.js');
+
+    const dshPkg = JSON.parse(
+      readFileSync(join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8')
+    );
+    log(`内置 dsh 就绪：${dshPkg.version}`);
   }
-  verifyZip();
-  extract();
 
-  if (!existsSync(NODE_EXE)) fail('解压后未找到 node.exe');
-  const ver = execFileSync(NODE_EXE, ['-v'], { encoding: 'utf8' }).trim();
-  log(`内置 Node 就绪：${ver}`);
-
-  // 2. 安装锁定版本的 dsh（npm 全局 prefix 即 node.exe 所在目录）
-  log(`安装 @deepseek-ai/dsh@${DSH_VERSION} …`);
-  execFileSync(
-    NODE_EXE,
-    [NPM_CLI, 'install', '--global', '--no-audit', '--no-fund', `@deepseek-ai/dsh@${DSH_VERSION}`],
-    { cwd: RUNTIME_DIR, stdio: 'inherit' }
-  );
-  if (!existsSync(DSH_BIN)) fail('dsh 安装后未找到 lib/bin.js');
-
-  const dshPkg = JSON.parse(
-    readFileSync(join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'package.json'), 'utf8')
-  );
-  log(`内置 dsh 就绪：${dshPkg.version}`);
+  // 3. 生成单文件 tar（与运行时目录独立幂等；--force 时重建）
+  if (force || !existsSync(TAR_PATH)) {
+    createRuntimeTar();
+  } else {
+    log('node-runtime.tar 已存在，跳过（--force 可重建）');
+  }
+  verifyTar();
   log('完成');
 }
 
