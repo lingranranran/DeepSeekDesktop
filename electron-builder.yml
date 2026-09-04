@@ -2,10 +2,18 @@
 appId: io.github.deepseek-harness.desktop
 productName: DeepSeek Harness Desktop
 
+# 自动更新源（M5，v0.2.0+）：electron-builder 依此生成 app-update.yml，
+# electron-updater 从该 GitHub 仓库的 Releases 拉取 latest.yml 做差量更新。
+# 本地构建用 --publish never 不受影响；CI 发布用 --publish always。
+publish:
+  provider: github
+  owner: lingranranran
+  repo: DeepSeekDesktop
+
 directories:
   output: release
 
-# 应用自身文件打进 app.asar（dependencies 为空，不会带入 node_modules）
+# 应用自身文件打进 app.asar（含 electron-updater 及其生产依赖，主进程运行时需要）
 files:
   - dist/**
   - renderer/**

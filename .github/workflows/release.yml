@@ -1,0 +1,49 @@
+# 发布流水线（M5，v0.2.0+）：推 v* 标签触发
+# 构建 NSIS 安装包并发布到 GitHub Releases（exe + blockmap + latest.yml），
+# 已安装的应用据此收到自动更新。
+#
+# 发布流程：版本号写进 package.json → 提交 → 打标签 → 推送：
+#   git tag v0.2.0 && git push origin v0.2.0
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write # 创建 Release 与上传产物
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Compile TypeScript
+        run: pnpm build
+
+      - name: Prepare bundled runtime (Node 22 + dsh, sha256 verified)
+        run: node scripts/prepare-runtime.mjs
+
+      - name: Build & publish installer
+        run: npx electron-builder --win --publish always
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload win-unpacked for smoke testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: win-unpacked
+          path: release/win-unpacked
+          retention-days: 7

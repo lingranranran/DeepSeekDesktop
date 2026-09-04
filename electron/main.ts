@@ -1,8 +1,18 @@
-import { app, BrowserWindow, globalShortcut, ipcMain, shell, Tray, nativeImage } from 'electron';
+import {
+  app,
+  BrowserWindow,
+  globalShortcut,
+  ipcMain,
+  shell,
+  Tray,
+  nativeImage,
+  Notification,
+} from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { DshManager } from './dsh-manager';
 import { ensureRuntime, readArchiveMeta } from './runtime-setup';
+import { UpdateManager, type UpdateStatus } from './updater';
 import { Logger } from './logger';
 import { loadWindowState, saveWindowState } from './window-state';
 import { loadSettings, saveSettings, type AppSettings } from './settings';
@@ -43,6 +53,9 @@ let isQuitting = false;
 /** 最终退出码（冒烟测试用；正常流程恒为 0） */
 let exitCode = 0;
 
+/** 正在退出以安装更新：退出流程改走 NSIS 安装器，而非 app.exit */
+let installingUpdate = false;
+
 /** dsh 进程管理器（优先使用 userData/runtime 首启解压出的内置运行时） */
 const dsh = new DshManager({
   runtimeDir: RUNTIME_DIR,
@@ -57,6 +70,12 @@ const dsh = new DshManager({
       void handleDshFailure(`服务无响应（端口 ${port} 连续健康检查失败）`);
     },
   },
+});
+
+/** 自动更新管理器（v0.2.0+；开发模式空转） */
+const updater = new UpdateManager({
+  logger,
+  onState: handleUpdateState,
 });
 
 // ---------- 单实例锁 ----------
@@ -77,6 +96,7 @@ if (!gotLock) {
 
 async function bootstrap(): Promise<void> {
   logger.info('应用启动');
+  updater.init(); // 事件接线（打包版才有实际行为）
   applyLoginItem(); // 同步开机自启状态（设置可能在别处被改动）
   createMainWindow();
   // 托盘与快捷键先于 dsh 就绪可用（dsh 启动可能需要数十秒）
@@ -104,12 +124,45 @@ async function loadMainWindowContent(): Promise<void> {
     if (win && !win.isDestroyed()) {
       await win.loadURL(`http://127.0.0.1:${port}`);
     }
-    if (SMOKE) void smokeReady(port);
+    if (SMOKE) {
+      void smokeReady(port);
+    } else if (updater.available) {
+      // 延迟静默检查更新：避开首启解压与 dsh 启动的 IO/带宽高峰
+      setTimeout(() => updater.check(), 15_000);
+    }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error(`启动失败：${msg}`);
     showFatal(msg);
   }
+}
+
+// ---------- 自动更新（v0.2.0+） ----------
+
+/** 更新状态变化：转发给设置窗口；下载完毕时弹系统通知（点击即安装） */
+function handleUpdateState(state: UpdateStatus): void {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('updates:state', state);
+  }
+  if (state.phase === 'downloaded' && !SMOKE && Notification.isSupported()) {
+    try {
+      const notice = new Notification({
+        title: 'DeepSeek Harness 有新版本',
+        body: `v${state.version} 已就绪，点击立即重启并安装`,
+      });
+      notice.on('click', () => installUpdate());
+      notice.show();
+    } catch {
+      /* 通知失败不影响主流程 */
+    }
+  }
+}
+
+/** 用户请求"重启并安装"：走正常退出流程（优雅停 dsh → NSIS 安装器接管） */
+function installUpdate(): void {
+  if (!updater.beginInstall()) return;
+  installingUpdate = true;
+  app.quit();
 }
 
 /**
@@ -424,7 +477,9 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', (event) => {
-  // 拦截第一次退出，先优雅停 dsh，再真正退出（exitCode 供冒烟测试判定成败）
+  // 二次进入（安装更新 / 自然退出放行）：不再拦截
+  if (isQuitting) return;
+  // 拦截第一次退出，先优雅停 dsh，再真正退出
   event.preventDefault();
   isQuitting = true;
   logger.info('应用退出');
@@ -432,6 +487,16 @@ app.on('before-quit', (event) => {
   tray?.destroy();
   tray = null;
   void dsh.stop().finally(() => {
+    if (installingUpdate) {
+      // 用户确认"重启并安装"：拉起 NSIS 安装器（其内部会完成应用退出）
+      updater.finishInstall();
+      return;
+    }
+    if (updater.isDownloaded) {
+      // 已静默下载新版本：走自然退出，让 autoInstallOnAppQuit 在 quit 钩子安装
+      app.quit();
+      return;
+    }
     app.exit(exitCode);
   });
 });

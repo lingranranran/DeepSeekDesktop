@@ -89,6 +89,16 @@
     </div>
     <div class="accel-hint">快捷键写法：Control+Shift+D、Alt+D、CommandOrControl+J 等（Electron accelerator 格式）</div>
 
+    <div class="row">
+      <div class="label">
+        <span class="title">当前版本</span>
+        <span class="hint" id="versionText">…</span>
+      </div>
+      <button class="link" id="checkUpdate" style="margin-top:0">检查更新</button>
+    </div>
+    <div class="accel-hint" id="updateStatus"></div>
+    <button class="link" id="installUpdate" style="display:none">重启并安装新版本</button>
+
     <button class="link" id="openLogs">打开日志目录</button>
     <div id="status"></div>
   </div>
@@ -137,6 +147,64 @@
     $('accelerator').addEventListener('change', save);
     $('openLogs').addEventListener('click', () => api.openLogs());
 
+    // ---------- 关于与更新 ----------
+
+    const updateStatus = $('updateStatus');
+    const installBtn = $('installUpdate');
+    const checkBtn = $('checkUpdate');
+
+    function renderUpdateState(state) {
+      installBtn.style.display = 'none';
+      checkBtn.disabled = false;
+      switch (state.phase) {
+        case 'idle':
+          updateStatus.textContent = '';
+          break;
+        case 'checking':
+          updateStatus.textContent = '正在检查更新…';
+          checkBtn.disabled = true;
+          break;
+        case 'available':
+          updateStatus.textContent = `发现新版本 v${state.version}，正在后台下载…`;
+          break;
+        case 'downloading':
+          updateStatus.textContent = `正在下载 v${state.version}… ${state.percent}%`;
+          break;
+        case 'downloaded':
+          updateStatus.textContent = `新版本 v${state.version} 已就绪`;
+          installBtn.style.display = 'inline-block';
+          break;
+        case 'not-available':
+          updateStatus.textContent = `已是最新版本（v${state.currentVersion}）`;
+          break;
+        case 'error':
+          updateStatus.textContent = `更新检查失败：${state.message ?? '未知错误'}`;
+          break;
+      }
+    }
+
+    async function initUpdateSection() {
+      $('versionText').textContent = `v${await api.getVersion()}`;
+      const available = await api.updatesAvailable();
+      if (!available) {
+        updateStatus.textContent = '开发模式下自动更新不可用（仅安装版生效）';
+        checkBtn.disabled = true;
+        return;
+      }
+      renderUpdateState(await api.getUpdateState());
+      api.onUpdateState(renderUpdateState);
+    }
+
+    checkBtn.addEventListener('click', async () => {
+      const result = await api.checkUpdates();
+      if (!result.ok) updateStatus.textContent = result.error ?? '检查失败';
+    });
+    installBtn.addEventListener('click', async () => {
+      const result = await api.installUpdate();
+      if (!result.ok) updateStatus.textContent = result.error ?? '安装失败';
+    });
+
+    void initUpdateSection();
     void load();
   </script>
 </body>
