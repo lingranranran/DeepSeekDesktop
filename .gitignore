@@ -1,0 +1,12 @@
+node_modules/
+dist/
+out/
+*.log
+.electron-cache/
+.eb-cache/
+.sandbox-dsh-home/
+resources/node-runtime/
+release/
+.DS_Store
+.pnpm-cache/
+.pnpm-store/

@@ -1,0 +1,13 @@
+# pnpm 11：构建脚本白名单与 store/cache 配置统一放在本文件
+allowBuilds:
+  electron: true
+  electron-winstaller: true
+
+storeDir: .pnpm-store
+cacheDir: .pnpm-cache
+
+# app-builder-lib 26.15.3 声明 @electron/get ^3.0.0 但锁到 3.0.0（缺少
+# ElectronDownloadCacheMode 导出导致打包崩溃），精确提升到 3.1.0；
+# 不影响 electron@33 自用的 @electron/get@2.0.0
+overrides:
+  app-builder-lib>@electron/get: 3.1.0

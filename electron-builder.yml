@@ -1,0 +1,39 @@
+# DeepSeek Harness Desktop 打包配置（Windows NSIS）
+appId: io.github.deepseek-harness.desktop
+productName: DeepSeek Harness Desktop
+
+directories:
+  output: release
+
+# 应用自身文件打进 app.asar（dependencies 为空，不会带入 node_modules）
+files:
+  - dist/**
+  - renderer/**
+  - resources/icons/**
+
+# 内置运行时（Node 22 LTS + 锁定版本 dsh）放在 asar 外，子进程可直接执行
+# 注意：from 必须是 resources 而非 resources/node-runtime——electron-builder 的
+# 文件过滤器会硬编码排除「from 根级」的 node_modules（filter.js: relative === "node_modules"），
+# 提升 from 后相对路径变为 node-runtime/node_modules，不再触发该排除
+extraResources:
+  - from: resources
+    to: .
+    filter:
+      - node-runtime/**/*
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  # 256px PNG，electron-builder 自动转换为 ico
+  icon: resources/icons/icon.png
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: DeepSeek Harness
+  artifactName: DeepSeek-Harness-Desktop-Setup-${version}.${ext}

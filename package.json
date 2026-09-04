@@ -1,0 +1,23 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness (dsh) Web UI 的 Windows 桌面封装：保留 dsh web 全部能力，叠加原生窗口与进程托管",
+  "main": "dist/main.js",
+  "productName": "DeepSeek Harness Desktop",
+  "author": "DeepSeek Harness Desktop Contributors",
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json && electron .",
+    "start": "electron .",
+    "prepare-runtime": "node scripts/prepare-runtime.mjs",
+    "dist": "tsc -p tsconfig.json && node scripts/prepare-runtime.mjs && electron-builder --win --publish never"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "electron": "^33.2.0",
+    "electron-builder": "^26.15.3",
+    "typescript": "^5.7.0"
+  }
+}

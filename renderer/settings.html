@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>设置 — DeepSeek Harness</title>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      margin: 0;
+      background: #0f1117;
+      color: #e6e6e6;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-size: 14px;
+    }
+    .wrap { padding: 24px 28px; max-width: 560px; }
+    h1 { font-size: 17px; margin: 0 0 20px; }
+    .row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 14px 16px; margin-bottom: 12px;
+      border: 1px solid #2a2d38; border-radius: 10px; background: #161923;
+    }
+    .row .label { display: flex; flex-direction: column; gap: 4px; }
+    .row .label .title { font-size: 14px; }
+    .row .label .hint { font-size: 12px; color: #7c8296; }
+    select, input[type="text"] {
+      background: #0f1117; color: #e6e6e6; border: 1px solid #2a2d38;
+      border-radius: 6px; padding: 6px 10px; font-size: 13px; outline: none;
+    }
+    select:focus, input[type="text"]:focus { border-color: #4f8cff; }
+    input[type="text"] { width: 170px; }
+    input[type="text"]:disabled { opacity: 0.4; }
+    .switch { position: relative; width: 40px; height: 22px; flex: none; }
+    .switch input { opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+    .slider {
+      position: absolute; inset: 0; border-radius: 11px;
+      background: #2a2d38; transition: background 0.15s;
+    }
+    .slider::after {
+      content: ''; position: absolute; top: 3px; left: 3px;
+      width: 16px; height: 16px; border-radius: 50%;
+      background: #8a8fa3; transition: transform 0.15s, background 0.15s;
+    }
+    .switch input:checked + .slider { background: #3d5cf4; }
+    .switch input:checked + .slider::after { transform: translateX(18px); background: #fff; }
+    .shortcut-controls { display: flex; align-items: center; gap: 8px; }
+    button.link {
+      background: none; border: none; color: #4f8cff; cursor: pointer;
+      font-size: 13px; padding: 0; margin-top: 6px;
+    }
+    button.link:hover { text-decoration: underline; }
+    #status { font-size: 12px; height: 16px; margin-top: 4px; }
+    #status.ok { color: #67c23a; }
+    #status.err { color: #f56c6c; }
+    .accel-hint { font-size: 12px; color: #7c8296; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>设置</h1>
+
+    <div class="row">
+      <div class="label">
+        <span class="title">关闭窗口时</span>
+        <span class="hint">关闭主窗口按钮的行为</span>
+      </div>
+      <select id="closeBehavior">
+        <option value="tray">最小化到托盘</option>
+        <option value="quit">直接退出应用</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <div class="label">
+        <span class="title">开机自启动</span>
+        <span class="hint">登录 Windows 时自动运行</span>
+      </div>
+      <label class="switch"><input type="checkbox" id="launchAtLogin"><span class="slider"></span></label>
+    </div>
+
+    <div class="row">
+      <div class="label">
+        <span class="title">全局快捷键唤起</span>
+        <span class="hint">从任意应用切换回本窗口</span>
+      </div>
+      <div class="shortcut-controls">
+        <input type="text" id="accelerator" placeholder="Control+Shift+D" spellcheck="false">
+        <label class="switch"><input type="checkbox" id="globalShortcutEnabled"><span class="slider"></span></label>
+      </div>
+    </div>
+    <div class="accel-hint">快捷键写法：Control+Shift+D、Alt+D、CommandOrControl+J 等（Electron accelerator 格式）</div>
+
+    <button class="link" id="openLogs">打开日志目录</button>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const api = window.dshDesktop;
+    const status = $('status');
+    let saveTimer = null;
+
+    function showStatus(ok, text) {
+      status.textContent = text;
+      status.className = ok ? 'ok' : 'err';
+      clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => { status.textContent = ''; }, 3000);
+    }
+
+    async function load() {
+      const s = await api.getSettings();
+      $('closeBehavior').value = s.closeBehavior;
+      $('launchAtLogin').checked = s.launchAtLogin;
+      $('globalShortcutEnabled').checked = s.globalShortcutEnabled;
+      $('accelerator').value = s.globalShortcutAccelerator;
+      $('accelerator').disabled = !s.globalShortcutEnabled;
+    }
+
+    async function save() {
+      const settings = {
+        closeBehavior: $('closeBehavior').value,
+        launchAtLogin: $('launchAtLogin').checked,
+        globalShortcutEnabled: $('globalShortcutEnabled').checked,
+        globalShortcutAccelerator: $('accelerator').value.trim() || 'Control+Shift+D',
+      };
+      $('accelerator').disabled = !settings.globalShortcutEnabled;
+      const result = await api.saveSettings(settings);
+      if (result.ok) {
+        showStatus(true, '已保存');
+      } else {
+        showStatus(false, `保存失败：${result.error ?? '未知错误'}`);
+      }
+    }
+
+    $('closeBehavior').addEventListener('change', save);
+    $('launchAtLogin').addEventListener('change', save);
+    $('globalShortcutEnabled').addEventListener('change', save);
+    $('accelerator').addEventListener('change', save);
+    $('openLogs').addEventListener('click', () => api.openLogs());
+
+    void load();
+  </script>
+</body>
+</html>
