@@ -131,7 +131,12 @@ export class DshManager {
 
     const portPromise = this.waitPort();
 
+    // 过期实例守卫：stop() → start() 快速切换（运行时切换/挂起自愈）时，
+    // 旧子进程的 exit/stdout 事件可能在新实例 spawn 之后才送达。
+    // 若不拦截，旧 exit 会把 this.child 置 null（新实例失管变孤儿）、
+    // 并以旧退出码 reject 新实例的端口 Promise（表现为“dsh 提前退出 exit code 1”）。
     child.stdout?.on('data', (chunk: string) => {
+      if (this.child !== child) return; // 迟到的旧实例输出，忽略
       for (const line of chunk.split(/\r?\n/)) {
         if (line) this.events.onLog?.(line);
         const m = PORT_LINE_RE.exec(line);
@@ -145,15 +150,18 @@ export class DshManager {
       }
     });
     child.stderr?.on('data', (chunk: string) => {
+      if (this.child !== child) return; // 迟到的旧实例输出，忽略
       for (const line of chunk.split(/\r?\n/)) {
         if (line) this.events.onLog?.(`[stderr] ${line}`);
       }
     });
 
     child.on('error', (err) => {
+      if (this.child !== child) return; // 迟到的旧实例错误，忽略
       this.failPort(new Error(`无法启动 dsh 进程：${err.message}`));
     });
     child.on('exit', (code) => {
+      if (this.child !== child) return; // 迟到的旧实例退出事件，忽略（见上方守卫说明）
       this.stopHealthCheck();
       this.failPort(new Error(`dsh 提前退出（exit code ${code}）。请查看日志排障。`));
       if (this.stopping) {
@@ -190,6 +198,11 @@ export class DshManager {
     if (pid === undefined) return;
 
     await new Promise<void>((resolve) => {
+      // 首选以子进程自身的 exit 事件 resolve：它触发时 start() 注册的 exit
+      // handler 已同步跑完，后续 start() 不会再收到本实例的迟到事件。
+      // （若在 taskkill 的 close 上 resolve，会抢在子进程 exit 事件派发之前，
+      // 紧接着的 start() 就会被迟到的旧 exit 事件污染——曾表现为切换运行时
+      // 时新 dsh “提前退出 exit code 1”实则正常存活但失管成孤儿。）
       child.once('exit', () => resolve());
       // Windows 下用 taskkill 温和终止整棵树（dsh 可能再 spawn 子进程）
       spawn('taskkill', ['/PID', String(pid), '/T'], { windowsHide: true }).on('error', () => {
@@ -197,9 +210,12 @@ export class DshManager {
       });
       setTimeout(() => {
         spawn('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }).on(
-          'close',
-          () => resolve()
+          'error',
+          () => {
+            /* 强杀失败也由下方兜底超时收尾 */
+          }
         );
+        // 兜底：/F 后 2s 子进程 exit 事件仍未送达（极端情况）则强制返回
         setTimeout(resolve, 2_000);
       }, TERM_TIMEOUT_MS);
     });
