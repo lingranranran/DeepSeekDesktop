@@ -1,30 +1,54 @@
 /**
- * 准备内置运行时（M4 打包用）：
- * 1. 下载 Node.js v22.23.2 win-x64 zip，校验 sha256 后解压到 resources/node-runtime/
- * 2. 用内置 npm 安装锁定版本的 @deepseek-ai/dsh 到同一运行时
- * 3. 将整个运行时打包为单文件 resources/node-runtime.tar（v0.1.1+ 分发方式：
+ * 准备运行时（M4 应用打包 / M6 独立运行时构建）：
+ * 1. 下载 Node.js v22.23.2 win-x64 zip，校验 sha256 后解压到构建工作区
+ * 2. 用内置 npm 安装指定版本的 @deepseek-ai/dsh 到同一运行时
+ * 3. 将整个运行时打包为单文件 tar（v0.1.1+ 分发方式：
  *    安装包只需写一个大文件，安装秒级完成；应用首次启动解压到 userData 并显示进度）
+ * 4. 输出 runtime.json 元数据（id / dsh / node 版本 / sha256 / 大小，M6 清单用）
+ *
+ * 无参数：构建应用内置运行时（resources/node-runtime.tar，dsh 版本锁定）
+ * 参数化（M6 CI 构建可下载运行时）：
+ *   --dsh <version>   指定 dsh 版本（默认内置锁定版本）
+ *   --workdir <dir>   构建工作区（默认 resources/node-runtime；--force 会清空重建）
+ *   --out <dir>       tar 与 runtime.json 输出目录（默认 resources）
+ *   --force           删除工作区后重建
  *
  * 幂等：运行时就绪且 tar 存在时跳过；--force 可删除后重建。
- * 用法：node scripts/prepare-runtime.mjs [--force]
+ * 用法：node scripts/prepare-runtime.mjs [--force] [--dsh <v>] [--workdir <dir>] [--out <dir>]
  */
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, readSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const NODE_VERSION = 'v22.23.2';
-const DSH_VERSION = '0.1.0-rc.6';
+/** 应用内置（打包进安装包）的 dsh 锁定版本 */
+const BUILTIN_DSH_VERSION = '0.1.0-rc.6';
+
+// ---------- 参数 ----------
+
+const argv = process.argv.slice(2);
+const argValue = (name) => {
+  const i = argv.indexOf(name);
+  return i >= 0 && i + 1 < argv.length ? argv[i + 1] : null;
+};
+const force = argv.includes('--force');
+const DSH_VERSION = argValue('--dsh') ?? BUILTIN_DSH_VERSION;
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const RUNTIME_DIR = join(ROOT, 'resources', 'node-runtime');
+/** 构建工作区（node + npm + dsh 安装目录） */
+const RUNTIME_DIR = resolve(argValue('--workdir') ?? join(ROOT, 'resources', 'node-runtime'));
+/** tar 与 runtime.json 输出目录 */
+const OUT_DIR = resolve(argValue('--out') ?? join(ROOT, 'resources'));
 const NODE_EXE = join(RUNTIME_DIR, 'node.exe');
 const NPM_CLI = join(RUNTIME_DIR, 'node_modules', 'npm', 'bin', 'npm-cli.js');
 const DSH_BIN = join(RUNTIME_DIR, 'node_modules', '@deepseek-ai', 'dsh', 'lib', 'bin.js');
 
-/** 单文件分发归档（electron-builder extraResources 只携带它） */
-const TAR_PATH = join(ROOT, 'resources', 'node-runtime.tar');
+/** 单文件分发归档 */
+const TAR_PATH = join(OUT_DIR, 'node-runtime.tar');
+/** 构建产物元数据（M6 运行时清单用） */
+const META_PATH = join(OUT_DIR, 'runtime.json');
 
 const NODE_URL = `https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-win-x64.zip`;
 const SHASUMS_URL = `https://nodejs.org/dist/${NODE_VERSION}/SHASUMS256.txt`;
@@ -182,6 +206,29 @@ function createRuntimeTar() {
   log(`node-runtime.tar 生成完毕（${(statSync(TAR_PATH).size / 1024 / 1024).toFixed(1)} MB）`);
 }
 
+/** 用系统 tar（bsdtar）交叉校验：条目数一致 + 最大文件内容逐字节一致 */
+function verifyTar() {
+  const { dirs, files } = walkTree(RUNTIME_DIR);
+  const listing = execFileSync('tar.exe', ['-tf', TAR_PATH], {
+    encoding: 'utf8',
+    maxBuffer: 64 * 1024 * 1024,
+  })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const expected = 1 + dirs.length + files.length; // meta + 目录 + 文件
+  if (listing.length !== expected) {
+    fail(`tar 校验失败：条目数 ${listing.length} ≠ 期望 ${expected}`);
+  }
+  // 抽样：node.exe（最大文件）内容逐字节比对
+  const probe = files.includes('node.exe') ? 'node.exe' : files[0];
+  const original = readFileSync(join(RUNTIME_DIR, probe));
+  const extracted = execFileSync('tar.exe', ['-xOf', TAR_PATH, probe], {
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  if (!original.equals(extracted)) fail(`tar 内容校验失败：${probe} 与源不一致`);
+  log(`tar 校验通过（${expected} 条目，抽查 ${probe}）`);
+}
+
 /** 安装异常诊断：打印 npm 全局 prefix 与关键目录内容，便于 CI 排障 */
 function dumpDshDiagnostics() {
   try {
@@ -215,38 +262,30 @@ function dumpDshDiagnostics() {
   }
 }
 
-/** 用系统 tar（bsdtar）交叉校验：条目数一致 + 最大文件内容逐字节一致 */
-function verifyTar() {
-  const { dirs, files } = walkTree(RUNTIME_DIR);
-  const listing = execFileSync('tar.exe', ['-tf', TAR_PATH], {
-    encoding: 'utf8',
-    maxBuffer: 64 * 1024 * 1024,
-  })
-    .split(/\r?\n/)
-    .filter(Boolean);
-  const expected = 1 + dirs.length + files.length; // meta + 目录 + 文件
-  if (listing.length !== expected) {
-    fail(`tar 校验失败：条目数 ${listing.length} ≠ 期望 ${expected}`);
+/** 流式计算文件 sha256 */
+function sha256File(p) {
+  const hash = createHash('sha256');
+  const CHUNK = 4 * 1024 * 1024;
+  const buf = Buffer.alloc(CHUNK);
+  const fd = openSync(p, 'r');
+  try {
+    let read;
+    while ((read = readSync(fd, buf, 0, buf.length, null)) > 0) hash.update(buf.subarray(0, read));
+  } finally {
+    closeSync(fd);
   }
-  // 抽样：node.exe（最大文件）内容逐字节比对
-  const probe = files.includes('node.exe') ? 'node.exe' : files[0];
-  const original = readFileSync(join(RUNTIME_DIR, probe));
-  const extracted = execFileSync('tar.exe', ['-xOf', TAR_PATH, probe], {
-    maxBuffer: 256 * 1024 * 1024,
-  });
-  if (!original.equals(extracted)) fail(`tar 内容校验失败：${probe} 与源不一致`);
-  log(`tar 校验通过（${expected} 条目，抽查 ${probe}）`);
+  return hash.digest('hex');
 }
 
 async function main() {
-  const force = process.argv.includes('--force');
+  log(`目标：dsh ${DSH_VERSION}，工作区 ${RUNTIME_DIR}，输出 ${OUT_DIR}`);
   if (force && existsSync(RUNTIME_DIR)) {
-    log('--force：删除现有 node-runtime …');
+    log('--force：删除现有工作区 …');
     rmSync(RUNTIME_DIR, { recursive: true, force: true });
   }
 
   if (isReady()) {
-    log('内置运行时已就绪，跳过下载与安装（--force 可重建）');
+    log('运行时已就绪，跳过下载与安装（--force 可重建）');
   } else {
     mkdirSync(RUNTIME_DIR, { recursive: true });
 
@@ -268,11 +307,22 @@ async function main() {
     const ver = execFileSync(NODE_EXE, ['-v'], { encoding: 'utf8' }).trim();
     log(`内置 Node 就绪：${ver}`);
 
-    // 2. 安装锁定版本的 dsh（npm 全局 prefix 即 node.exe 所在目录）
+    // 2. 安装指定版本的 dsh（显式 --prefix 钉死安装位置：
+    //    GitHub Windows runner 的 runneradmin .npmrc 预置 prefix=C:\npm\prefix，
+    //    会把全局安装劫持到别处；命令行 --prefix 优先级最高，可覆盖任何配置）
     const dshInstall = () =>
       execFileSync(
         NODE_EXE,
-        [NPM_CLI, 'install', '--global', '--no-audit', '--no-fund', `@deepseek-ai/dsh@${DSH_VERSION}`],
+        [
+          NPM_CLI,
+          'install',
+          '--global',
+          '--prefix',
+          RUNTIME_DIR,
+          '--no-audit',
+          '--no-fund',
+          `@deepseek-ai/dsh@${DSH_VERSION}`,
+        ],
         { cwd: RUNTIME_DIR, stdio: 'inherit' }
       );
     log(`安装 @deepseek-ai/dsh@${DSH_VERSION} …`);
@@ -300,6 +350,17 @@ async function main() {
     log('node-runtime.tar 已存在，跳过（--force 可重建）');
   }
   verifyTar();
+
+  // 4. 输出元数据（M6：运行时清单与应用侧 sha256 校验用）
+  const meta = {
+    id: RUNTIME_ID,
+    dshVersion: DSH_VERSION,
+    nodeVersion: NODE_VERSION.replace(/^v/, ''),
+    sha256: sha256File(TAR_PATH),
+    sizeBytes: statSync(TAR_PATH).size,
+  };
+  writeFileSync(META_PATH, `${JSON.stringify(meta, null, 2)}\n`);
+  log(`runtime.json 已生成（sha256=${meta.sha256.slice(0, 16)}…，${(meta.sizeBytes / 1024 / 1024).toFixed(1)} MB）`);
   log('完成');
 }
 

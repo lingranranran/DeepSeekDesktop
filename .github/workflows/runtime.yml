@@ -1,0 +1,78 @@
+# 运行时构建流水线（M6，v0.3.0+）：
+# - 每日定时（北京时间 02:00）自动发现未构建的 dsh 新版本并构建（每次最多 2 个）
+# - 支持手动触发（可指定版本，用于补建/重建）
+# 产物：GitHub prerelease（tag runtime-v<版本>）挂 node-runtime.tar + runtime.json，
+# 并提交 runtime-manifest.json 到 main；应用设置页据此发现/下载/切换运行时。
+# 注意：runtime release 一律标记 prerelease，避免被 electron-updater 误认为应用更新。
+name: Runtime
+
+on:
+  schedule:
+    - cron: '0 18 * * *' # UTC 18:00 = 北京时间 02:00
+  workflow_dispatch:
+    inputs:
+      dsh_version:
+        description: '指定构建的 dsh 版本（留空则自动发现未构建的新版本）'
+        required: false
+        type: string
+
+permissions:
+  contents: write # 创建 prerelease、上传资产、提交 manifest
+
+jobs:
+  runtime:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Discover new dsh versions
+        id: discover
+        if: ${{ !inputs.dsh_version }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # npm 全部版本（升序）减去清单已收录与 release 已存在的，取前 2 个
+          $all = @(npm view "@deepseek-ai/dsh" versions --json | ConvertFrom-Json)
+          $manifest = if (Test-Path 'runtime-manifest.json') { Get-Content 'runtime-manifest.json' -Raw | ConvertFrom-Json } else { $null }
+          $built = if ($manifest -and $manifest.runtimes) { @($manifest.runtimes | ForEach-Object { $_.dshVersion }) } else { @() }
+          $baseline = '0.1.0-rc.6'
+          $start = [array]::IndexOf([string[]]$all, $baseline)
+          if ($start -lt 0) { $start = 0 }
+          $pending = New-Object System.Collections.Generic.List[string]
+          for ($i = $start; $i -lt $all.Count; $i++) {
+            $v = [string]$all[$i]
+            if ($built -contains $v) { continue }
+            gh release view "runtime-v$v" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { continue } # release 已在（清单未记上），不重复构建
+            $pending.Add($v)
+            if ($pending.Count -ge 2) { break }
+          }
+          $list = ($pending -join ',')
+          "versions=$list" | Add-Content -Path $env:GITHUB_OUTPUT -Encoding utf8
+          Write-Output "待构建版本：$list"
+
+      - name: Build & publish runtimes
+        if: ${{ inputs.dsh_version != '' || steps.discover.outputs.versions != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/publish-runtimes.mjs --versions "${{ inputs.dsh_version || steps.discover.outputs.versions }}"
+
+      - name: Commit manifest
+        if: ${{ inputs.dsh_version != '' || steps.discover.outputs.versions != '' }}
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add runtime-manifest.json
+          if (git diff --cached --quiet) {
+            Write-Output 'manifest 无变化，跳过提交'
+          } else {
+            git commit -m "chore(runtime): update runtime manifest"
+            git push
+          }
