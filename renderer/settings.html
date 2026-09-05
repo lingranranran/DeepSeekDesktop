@@ -92,6 +92,16 @@
       height: 100%; width: 0; border-radius: 3px; background: #3d5cf4;
       transition: width 0.2s;
     }
+    button.link:disabled { opacity: 0.5; cursor: default; }
+    /* 诊断区（M7） */
+    .diag-log {
+      margin: 6px 0 12px; padding: 10px 12px;
+      background: #0f1117; border: 1px solid #2a2d38; border-radius: 8px;
+      font-family: Consolas, "Courier New", monospace; font-size: 11.5px;
+      line-height: 1.5; color: #a8adbd;
+      max-height: 220px; overflow: auto; white-space: pre-wrap; word-break: break-all;
+      user-select: text;
+    }
   </style>
 </head>
 <body>
@@ -129,6 +139,14 @@
     </div>
     <div class="accel-hint">快捷键写法：Control+Shift+D、Alt+D、CommandOrControl+J 等（Electron accelerator 格式）</div>
 
+    <div class="row">
+      <div class="label">
+        <span class="title">桌面通知</span>
+        <span class="hint">窗口不在前台时，任务完成或等待审批发送系统通知</span>
+      </div>
+      <label class="switch"><input type="checkbox" id="desktopNotifications"><span class="slider"></span></label>
+    </div>
+
     <details id="runtimeSection" class="runtime-details">
       <summary>运行时管理（dsh 版本独立升级 / 回滚）</summary>
       <div class="rt-subtitle">本地运行时</div>
@@ -142,6 +160,21 @@
         <div class="rt-progress-label" id="runtimeProgressLabel"></div>
         <div class="rt-progress-bar"><div class="rt-progress-fill" id="runtimeProgressFill"></div></div>
       </div>
+    </details>
+
+    <details id="diagSection" class="runtime-details">
+      <summary>诊断（最近日志 / 导出诊断包）</summary>
+      <div class="rt-subtitle">
+        最近日志（今日末 200 行）
+        <button class="link" id="refreshLogTail" style="margin-top:0">刷新</button>
+        <button class="link" id="copyLogTail" style="margin-top:0">复制</button>
+      </div>
+      <pre id="logTail" class="diag-log">（展开后加载）</pre>
+      <div class="rt-subtitle">
+        诊断包（环境信息 + 近 7 天日志）
+        <button class="link" id="exportDiag" style="margin-top:0">导出</button>
+      </div>
+      <div class="accel-hint" style="margin-bottom:14px">导出为单个文本文件，适合随问题报告附上（不包含任何密钥或凭据）</div>
     </details>
 
     <div class="row">
@@ -171,6 +204,15 @@
       saveTimer = setTimeout(() => { status.textContent = ''; }, 3000);
     }
 
+    // M7：?section=runtime 直达定位（运行时新版本通知点击进入）
+    (() => {
+      const section = new URLSearchParams(location.search).get('section');
+      if (section !== 'runtime') return;
+      const el = $('runtimeSection');
+      el.open = true;
+      setTimeout(() => el.scrollIntoView({ behavior: 'smooth', block: 'start' }), 60);
+    })();
+
     async function load() {
       const s = await api.getSettings();
       $('closeBehavior').value = s.closeBehavior;
@@ -178,6 +220,7 @@
       $('globalShortcutEnabled').checked = s.globalShortcutEnabled;
       $('accelerator').value = s.globalShortcutAccelerator;
       $('accelerator').disabled = !s.globalShortcutEnabled;
+      $('desktopNotifications').checked = s.desktopNotifications;
     }
 
     async function save() {
@@ -186,6 +229,7 @@
         launchAtLogin: $('launchAtLogin').checked,
         globalShortcutEnabled: $('globalShortcutEnabled').checked,
         globalShortcutAccelerator: $('accelerator').value.trim() || 'Control+Shift+D',
+        desktopNotifications: $('desktopNotifications').checked,
       };
       $('accelerator').disabled = !settings.globalShortcutEnabled;
       const result = await api.saveSettings(settings);
@@ -200,7 +244,54 @@
     $('launchAtLogin').addEventListener('change', save);
     $('globalShortcutEnabled').addEventListener('change', save);
     $('accelerator').addEventListener('change', save);
+    $('desktopNotifications').addEventListener('change', save);
     $('openLogs').addEventListener('click', () => api.openLogs());
+
+    // ---------- 诊断区（M7） ----------
+
+    const logTailEl = $('logTail');
+
+    async function refreshLogTail() {
+      logTailEl.textContent = '加载中…';
+      try {
+        const r = await api.readLogTail();
+        logTailEl.textContent = r.ok && r.content ? r.content : '（暂无日志）';
+      } catch {
+        logTailEl.textContent = '（读取失败）';
+        return;
+      }
+      logTailEl.scrollTop = logTailEl.scrollHeight; // 滚到底部（最新在末尾）
+    }
+
+    $('refreshLogTail').addEventListener('click', () => void refreshLogTail());
+
+    $('copyLogTail').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(logTailEl.textContent);
+        showStatus(true, '已复制到剪贴板');
+      } catch {
+        showStatus(false, '复制失败，可手动选择文本复制');
+      }
+    });
+
+    $('exportDiag').addEventListener('click', async () => {
+      const btn = $('exportDiag');
+      btn.disabled = true;
+      try {
+        const r = await api.exportDiagnostics();
+        if (r.ok) showStatus(true, '诊断包已导出');
+        else if (r.canceled) showStatus(true, '已取消导出');
+        else showStatus(false, `导出失败：${r.error ?? '未知错误'}`);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    // 展开诊断区时才拉取日志（避免无谓 IO）
+    $('diagSection').addEventListener('toggle', () => {
+      if ($('diagSection').open) void refreshLogTail();
+    });
+
 
     // ---------- 关于与更新 ----------
 

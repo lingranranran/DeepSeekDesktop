@@ -2,6 +2,17 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 
+/**
+ * M7.3：桌面桥事件（resources/dsh-bridge 插件经 stdout 标记行上报，
+ * 由 DshManager 解析后回调给主进程发系统通知）。
+ */
+export type DesktopBridgeEvent =
+  | { type: 'agent-idle' }
+  | {
+      type: 'approval-request';
+      payload: { toolName: string; reason: string | null; callId: string | null };
+    };
+
 /** dsh 管理器事件 */
 export interface DshManagerEvents {
   /** dsh 服务退出 */
@@ -12,6 +23,8 @@ export interface DshManagerEvents {
   onHung: (port: number) => void;
   /** 服务输出一行日志 */
   onLog: (line: string) => void;
+  /** M7.3：桌面桥事件（任务完成 / 等待权限审批） */
+  onDesktopEvent: (event: DesktopBridgeEvent) => void;
 }
 
 /** dsh 管理器构造选项 */
@@ -27,11 +40,19 @@ export interface DshManagerOptions {
 /** 从 stdout 解析端口的正则（实测输出：dsh web: http://127.0.0.1:60429） */
 const PORT_LINE_RE = /dsh web: http:\/\/127\.0\.0\.1:(\d+)/;
 
+/** M7.3：桌面桥标记行（dsh-bridge 插件写入，payload 为单行 JSON） */
+const DESKTOP_EVENT_RE = /^@@DSH_DESKTOP_EVENT@@ (\{.*\})$/;
+
 /** 启动后等待端口出现的超时（毫秒） */
 const PORT_TIMEOUT_MS = 60_000;
 
-/** 优雅退出等待超时（毫秒），超时后强杀 */
-const TERM_TIMEOUT_MS = 5_000;
+/**
+ * 优雅退出等待超时（毫秒），超时后强杀。
+ * 实测 taskkill（不带 /F）对 windowsHide 的无控制台进程无效（无窗口可收
+ * WM_CLOSE），温和阶段必然空转到超时——所以这个值就是每次退出的固定开销，
+ * 保持 1s：给极少数带窗口的运行时变体留一点余量，同时退出足够快。
+ */
+const TERM_TIMEOUT_MS = 1_000;
 
 /** 健康检查轮询间隔（毫秒） */
 const HEALTH_INTERVAL_MS = 10_000;
@@ -67,6 +88,8 @@ export class DshManager {
   private healthFailures = 0;
   private readonly events: Partial<DshManagerEvents>;
   private runtimeDir: string | undefined;
+  /** M7.3：桌面桥 --patch 覆盖层文件路径（null = 不注入） */
+  private desktopBridgePatch: string | null = null;
 
   constructor(opts: DshManagerOptions = {}) {
     this.events = opts.events ?? {};
@@ -79,6 +102,15 @@ export class DshManager {
    */
   setRuntimeDir(dir: string | undefined): void {
     this.runtimeDir = dir;
+  }
+
+  /**
+   * M7.3：设置桌面桥 --patch 覆盖层文件路径（null = 不注入）。
+   * 覆盖层引用应用自带的 dsh-bridge 插件（asar 外分发），
+   * 把 dsh 内部事件转为 stdout 标记行，由本管理器解析。
+   */
+  setDesktopBridgePatch(patchYml: string | null): void {
+    this.desktopBridgePatch = patchYml;
   }
 
   /** dsh 是否已在运行 */
@@ -114,9 +146,15 @@ export class DshManager {
     this.port = null;
 
     // --no-open：禁止 dsh 拉起系统默认浏览器（桌面端由主窗口呈现同一页面）
+    // M7.3：--patch 注入桌面桥覆盖层。必须紧跟 web 之后、--host 等未知参数之前：
+    // web 解析器启用 passThroughOptions，首个未知选项/位置参数之后的 token 全部透传，
+    // 放后面会导致 --patch 落入透传区、被 web app 当未知参数拒绝（exit 1）
+    const bridgeArgs = this.desktopBridgePatch
+      ? ['--patch', this.desktopBridgePatch]
+      : [];
     this.child = spawn(
       node,
-      [dshBin, 'web', '--host', '127.0.0.1', '--port', '0', '--no-open', ...args],
+      [dshBin, 'web', ...bridgeArgs, '--host', '127.0.0.1', '--port', '0', '--no-open', ...args],
       {
         cwd: process.cwd(),
         env: this.buildEnv(),
@@ -139,6 +177,8 @@ export class DshManager {
       if (this.child !== child) return; // 迟到的旧实例输出，忽略
       for (const line of chunk.split(/\r?\n/)) {
         if (line) this.events.onLog?.(line);
+        const bridge = DESKTOP_EVENT_RE.exec(line);
+        if (bridge) this.parseDesktopEvent(bridge[1]); // 标记行同时保留在日志里，便于排障
         const m = PORT_LINE_RE.exec(line);
         if (m) {
           this.port = Number(m[1]);
@@ -223,6 +263,18 @@ export class DshManager {
   }
 
   // ---------- 内部工具 ----------
+
+  /** M7.3：解析桌面桥标记行 payload（非法 JSON/未知类型静默忽略，不影响端口解析） */
+  private parseDesktopEvent(raw: string): void {
+    try {
+      const parsed = JSON.parse(raw) as DesktopBridgeEvent;
+      if (parsed && (parsed.type === 'agent-idle' || parsed.type === 'approval-request')) {
+        this.events.onDesktopEvent?.(parsed);
+      }
+    } catch {
+      /* 非法标记行忽略 */
+    }
+  }
 
   /** 启动对根路径的周期性健康检查，连续失败判定挂起 */
   private startHealthCheck(port: number): void {

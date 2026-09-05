@@ -59,6 +59,16 @@ contextBridge.exposeInMainWorld('dshDesktop', {
     ipcRenderer.invoke('settings:set', settings),
   /** 在系统资源管理器中打开日志目录 */
   openLogs: (): Promise<void> => ipcRenderer.invoke('app:open-logs'),
+  /** 读取当天日志尾部（诊断区查看器，最近 200 行） */
+  readLogTail: (): Promise<{ ok: boolean; content?: string; error?: string }> =>
+    ipcRenderer.invoke('diag:read-log-tail'),
+  /** 导出诊断包（环境信息 + 保留期日志 → 单个 txt），保存后自动在资源管理器中定位 */
+  exportDiagnostics: (): Promise<{
+    ok: boolean;
+    canceled?: boolean;
+    path?: string;
+    error?: string;
+  }> => ipcRenderer.invoke('diag:export'),
   /** 当前应用版本（package.json version） */
   getVersion: (): Promise<string> => ipcRenderer.invoke('app:get-version'),
   /** 自动更新能力是否可用（开发模式为 false） */

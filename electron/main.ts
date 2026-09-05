@@ -8,9 +8,12 @@ import {
   nativeImage,
   Notification,
 } from 'electron';
-import { existsSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { DshManager } from './dsh-manager';
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { join, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { arch, release } from 'node:os';
+import { DshManager, type DesktopBridgeEvent } from './dsh-manager';
+import { readLogTail, exportDiagnostics } from './diagnostics';
 import { ensureRuntime, readArchiveMeta } from './runtime-setup';
 import {
   builtinRuntimeDir,
@@ -44,7 +47,15 @@ const SMOKE = process.argv.includes('--smoke');
 const SMOKE_TIMEOUT_MS = 90_000;
 
 // 固定 userData：不受打包后 productName 影响，开发/安装版共享同一数据目录
-app.setPath('userData', join(app.getPath('appData'), 'deepseek-harness-desktop'));
+// 冒烟模式例外：隔离到 out/smoke-userdata —— 沙箱/CI 环境写不了真实 AppData，
+// 同时避免冒烟运行污染开发者的真实设置/日志/运行时；目录持久化以便复用已解压的运行时
+// 打包版 getAppPath() 指向只读 asar，须改用 exe 所在目录（win-unpacked 根）
+if (SMOKE) {
+  const smokeBase = app.isPackaged ? dirname(process.execPath) : app.getAppPath();
+  app.setPath('userData', join(smokeBase, 'out', 'smoke-userdata'));
+} else {
+  app.setPath('userData', join(app.getPath('appData'), 'deepseek-harness-desktop'));
+}
 
 /** v0.1.1+：内置运行时首启解压目录（userData/runtime） */
 const RUNTIME_DIR = builtinRuntimeDir();
@@ -94,6 +105,7 @@ const dsh = new DshManager({
       logger.error(`[dsh] 服务无响应（端口 ${port} 连续健康检查失败）`);
       void handleDshFailure(`服务无响应（端口 ${port} 连续健康检查失败）`);
     },
+    onDesktopEvent: (event) => handleDesktopEvent(event),
   },
 });
 
@@ -131,6 +143,7 @@ async function bootstrap(): Promise<void> {
     onQuit: () => app.quit(),
   });
   applyGlobalShortcut();
+  setupDesktopBridge(); // M7.3：注入桌面桥 --patch 覆盖层（须在首次 dsh.start 前完成）
   await loadMainWindowContent();
 }
 
@@ -151,9 +164,13 @@ async function loadMainWindowContent(): Promise<void> {
     }
     if (SMOKE) {
       void smokeReady(port);
-    } else if (updater.available) {
-      // 延迟静默检查更新：避开首启解压与 dsh 启动的 IO/带宽高峰
-      setTimeout(() => updater.check(), 15_000);
+    } else {
+      if (updater.available) {
+        // 延迟静默检查更新：避开首启解压与 dsh 启动的 IO/带宽高峰
+        setTimeout(() => updater.check(), 15_000);
+      }
+      // M7：后台检查 dsh 运行时新版本（再延 15s，与更新检查错峰）
+      setTimeout(() => void checkRuntimeUpdate(), 30_000);
     }
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -163,6 +180,46 @@ async function loadMainWindowContent(): Promise<void> {
 }
 
 // ---------- 自动更新（v0.2.0+） ----------
+
+/**
+ * M7：后台检查 dsh 运行时新版本（启动 30s 后执行一次）。
+ * 发现比当前激活运行时更新的版本且未提醒过 → 系统通知（点击直达运行时管理）。
+ * 每个版本只提醒一次（settings.lastNotifiedRuntimeId）；网络失败静默记日志。
+ */
+async function checkRuntimeUpdate(): Promise<void> {
+  try {
+    const manifest = await fetchRuntimeManifest();
+    if (manifest.length === 0) return;
+    manifest.sort((a, b) => compareDshVersions(b.dshVersion, a.dshVersion));
+    availableRuntimes = manifest; // 顺带填充缓存，设置页稍后打开可复用
+    const newest = manifest[0];
+    if (newest.id === settings.lastNotifiedRuntimeId) return; // 该版本已提醒过
+
+    const active = listLocalRuntimes(settings.activeRuntimeId).find((r) => r.active);
+    const activeVersion = active?.dshVersion ?? '';
+    if (!activeVersion || compareDshVersions(newest.dshVersion, activeVersion) <= 0) return;
+
+    settings.lastNotifiedRuntimeId = newest.id;
+    saveSettings(settings);
+    logger.info(
+      `发现新运行时：dsh ${newest.dshVersion}（当前 ${activeVersion}），已发送桌面提醒`
+    );
+    if (!Notification.isSupported()) return;
+    try {
+      const notice = new Notification({
+        title: 'dsh 有新版本',
+        body: `dsh ${newest.dshVersion} 可用（当前 ${activeVersion}），点击打开运行时管理`,
+      });
+      notice.on('click', () => openSettingsWindow('runtime'));
+      notice.show();
+    } catch {
+      /* 通知失败不影响主流程 */
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`运行时新版本检查失败（下次启动重试）：${msg}`);
+  }
+}
 
 /** 更新状态变化：转发给设置窗口；下载完毕时弹系统通知（点击即安装） */
 function handleUpdateState(state: UpdateStatus): void {
@@ -188,6 +245,72 @@ function installUpdate(): void {
   if (!updater.beginInstall()) return;
   installingUpdate = true;
   app.quit();
+}
+
+// ---------- 桌面桥（M7.3：dsh 内部事件 → 系统通知） ----------
+
+/**
+ * M7.3：装配桌面桥 —— 生成 --patch 覆盖层，让 dsh 加载应用自带的 dsh-bridge 插件。
+ * 插件把 agent 状态与审批请求以 stdout 标记行上报（见 resources/dsh-bridge/index.js），
+ * DshManager 解析后经 onDesktopEvent 回调至此。注入是无条件的（插件存在即注入），
+ * 设置项 desktopNotifications 只门控通知显示 —— 开关即时生效、无需重启 dsh。
+ * 插件缺失或 patch 写入失败仅记日志降级，不影响 dsh 正常启动。
+ */
+function setupDesktopBridge(): void {
+  const resourcesPath = (process as unknown as { resourcesPath?: string }).resourcesPath;
+  // 插件必须在 asar 外（dsh 是独立 node.exe，读不了 app.asar 内的文件）：
+  // 打包版位于 <安装>\resources\dsh-bridge；开发模式回退项目 resources/ 目录。
+  const candidates = [
+    resourcesPath ? join(resourcesPath, 'dsh-bridge', 'index.js') : null,
+    join(app.getAppPath(), 'resources', 'dsh-bridge', 'index.js'),
+  ];
+  const pluginPath = candidates.find((p) => p && existsSync(p));
+  if (!pluginPath) {
+    logger.warn('未找到 dsh-bridge 插件，桌面通知桥接未启用');
+    return;
+  }
+  const patchFile = join(app.getPath('userData'), 'dsh-desktop-bridge.yml');
+  // 覆盖层格式 = PatchOptions 列表；insert 不带 id 即追加到根条目列表，
+  // name 为模块 specifier（绝对 file:// URL，cordis-plugin-loader 直接动态导入）
+  const yml = [
+    '# 由 DeepSeek Harness Desktop 自动生成（桌面通知桥接），请勿手动编辑',
+    '- insert:',
+    '    - id: dsh-desktop-bridge',
+    `      name: '${pathToFileURL(pluginPath).href}'`,
+    '',
+  ].join('\n');
+  try {
+    writeFileSync(patchFile, yml, 'utf8');
+    dsh.setDesktopBridgePatch(patchFile);
+    logger.info(`桌面桥已启用：${pluginPath}`);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.warn(`桌面桥 patch 文件写入失败，桥接未启用：${msg}`);
+  }
+}
+
+/** 桌面桥事件 → 系统通知（仅窗口不在前台时发送；点击聚焦主窗口） */
+function handleDesktopEvent(event: DesktopBridgeEvent): void {
+  if (SMOKE) return;
+  if (!settings.desktopNotifications) return;
+  const win = mainWindow;
+  if (win && !win.isDestroyed() && win.isFocused()) return; // 前台盯着页面时不打扰
+  if (!Notification.isSupported()) return;
+  try {
+    const notice =
+      event.type === 'agent-idle'
+        ? new Notification({ title: '任务已完成', body: 'dsh 任务已结束，点击查看结果' })
+        : new Notification({
+            title: '等待权限审批',
+            body: event.payload.reason
+              ? `工具 ${event.payload.toolName} 请求授权：${event.payload.reason}`
+              : `工具 ${event.payload.toolName} 请求授权，点击处理`,
+          });
+    notice.on('click', () => showMainWindow());
+    notice.show();
+  } catch {
+    /* 通知失败不影响主流程 */
+  }
 }
 
 /**
@@ -369,9 +492,24 @@ function toggleMainWindow(): void {
 
 // ---------- 设置窗口与 IPC ----------
 
-function openSettingsWindow(): void {
+/**
+ * 打开设置窗口。
+ * @param section 可选定位区（'runtime' = 运行时管理）：经 URL 查询参数传给
+ * 渲染端，页面加载后自动展开并滚动到对应区块。已打开时带 section 会重新
+ * 导航（设置页轻量、状态全部经 IPC 恢复，重载无副作用）。
+ */
+function openSettingsWindow(section?: 'runtime'): void {
+  const load = (wc: Electron.WebContents): void => {
+    void wc.loadFile(join(__dirname, '..', 'renderer', 'settings.html'), {
+      query: section ? { section } : undefined,
+    });
+  };
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     settingsWindow.focus();
+    // 已打开时带 section → 重新导航定位（页面轻量、状态经 IPC 恢复，无副作用）
+    if (section && !settingsWindow.webContents.isLoading()) {
+      load(settingsWindow.webContents);
+    }
     return;
   }
   const win = new BrowserWindow({
@@ -396,7 +534,7 @@ function openSettingsWindow(): void {
   win.on('closed', () => {
     settingsWindow = null;
   });
-  void win.loadFile(join(__dirname, '..', 'renderer', 'settings.html'));
+  load(win.webContents);
 }
 
 ipcMain.handle('settings:get', () => settings);
@@ -410,9 +548,13 @@ ipcMain.handle('settings:set', (_event, incoming: Partial<AppSettings>) => {
       typeof incoming.globalShortcutAccelerator === 'string' && incoming.globalShortcutAccelerator.length > 0
         ? incoming.globalShortcutAccelerator
         : 'Control+Shift+D',
+    // M7.3：桌面通知开关只门控通知显示（桥接注入无条件），切换即时生效、无需重启 dsh
+    desktopNotifications: incoming.desktopNotifications !== false,
     // 运行时激活由专门的 runtimes:activate IPC 维护（涉及 dsh 重启与回滚），
     // 设置页普通保存不触碰该字段
     activeRuntimeId: settings.activeRuntimeId,
+    // M7：运行时新版本提醒的免打扰记忆同样由主进程单独维护
+    lastNotifiedRuntimeId: settings.lastNotifiedRuntimeId,
   };
   saveSettings(settings);
   applyLoginItem();
@@ -422,6 +564,29 @@ ipcMain.handle('settings:set', (_event, incoming: Partial<AppSettings>) => {
 
 ipcMain.handle('app:open-logs', () => {
   void shell.openPath(logger.logDir);
+});
+
+// ---------- 诊断区（M7：日志尾部查看器 + 一键导出诊断包） ----------
+
+ipcMain.handle('diag:read-log-tail', () => ({ ok: true, content: readLogTail(logger) }));
+
+ipcMain.handle('diag:export', () => {
+  const runtimes = listLocalRuntimes(settings.activeRuntimeId);
+  const active = runtimes.find((r) => r.active);
+  const env = {
+    应用版本: app.getVersion(),
+    Electron: process.versions.electron,
+    'Node.js（宿主）': process.versions.node,
+    Chromium: process.versions.chrome,
+    操作系统: `${process.platform} ${release()} (${arch()})`,
+    'userData 目录': app.getPath('userData'),
+    激活运行时: active ? `dsh ${active.dshVersion}（node ${active.nodeVersion}）` : '内置（未发现）',
+    本地运行时:
+      runtimes
+        .map((r) => `${r.dshVersion}${r.builtIn ? ' [内置]' : ''}${r.active ? ' [激活]' : ''}${r.healthy ? '' : ' [异常]'}`)
+        .join('、') || '（无）',
+  };
+  return exportDiagnostics(logger, env, settingsWindow);
 });
 
 // ---------- 运行时管理（M6：独立下载/切换/回滚 dsh 运行时） ----------

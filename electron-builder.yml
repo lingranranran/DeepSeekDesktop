@@ -28,6 +28,9 @@ extraResources:
     to: .
     filter:
       - node-runtime.tar
+      # M7.3 桌面桥插件：dsh 以独立 node 进程经 file:// URL 加载，读不了 app.asar，
+      # 必须随包落在 asar 外的 resources/dsh-bridge/
+      - dsh-bridge/**
 
 win:
   target:
