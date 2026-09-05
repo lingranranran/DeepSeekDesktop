@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-desktop",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "DeepSeek Harness (dsh) Web UI 的 Windows 桌面封装：保留 dsh web 全部能力，叠加原生窗口与进程托管",
   "main": "dist/main.js",
   "productName": "DeepSeek Harness Desktop",
