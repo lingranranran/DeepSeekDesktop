@@ -41,6 +41,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # electron-builder 26.x 并行上传竞态会为同一 tag 产生两个草稿且均不发布，
+      # 资产分散后自动更新失效；此步骤合并资产、发布并清理重复草稿（幂等）
+      - name: Consolidate & publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: node scripts/fix-release.mjs --tag ${{ github.ref_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Upload win-unpacked for smoke testing
         uses: actions/upload-artifact@v4
         with:

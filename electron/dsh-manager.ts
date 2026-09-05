@@ -66,11 +66,19 @@ export class DshManager {
   private healthTimer: NodeJS.Timeout | null = null;
   private healthFailures = 0;
   private readonly events: Partial<DshManagerEvents>;
-  private readonly runtimeDir: string | undefined;
+  private runtimeDir: string | undefined;
 
   constructor(opts: DshManagerOptions = {}) {
     this.events = opts.events ?? {};
     this.runtimeDir = opts.runtimeDir;
+  }
+
+  /**
+   * M6：切换运行时目录（激活其他版本的运行时后、重启 dsh 前调用）。
+   * 必须先 stop() 再切换，否则正在运行的进程仍指向旧目录。
+   */
+  setRuntimeDir(dir: string | undefined): void {
+    this.runtimeDir = dir;
   }
 
   /** dsh 是否已在运行 */

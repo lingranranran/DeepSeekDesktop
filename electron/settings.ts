@@ -12,6 +12,11 @@ export interface AppSettings {
   globalShortcutEnabled: boolean;
   /** 全局快捷键（Electron accelerator 格式，如 Control+Shift+D） */
   globalShortcutAccelerator: string;
+  /**
+   * M6：激活的独立运行时 id（null = 应用内置运行时）。
+   * 由运行时管理 IPC（runtimes:activate）单独维护，设置页普通保存不触碰。
+   */
+  activeRuntimeId: string | null;
 }
 
 export const DEFAULT_SETTINGS: AppSettings = {
@@ -19,6 +24,7 @@ export const DEFAULT_SETTINGS: AppSettings = {
   launchAtLogin: false,
   globalShortcutEnabled: false,
   globalShortcutAccelerator: 'Control+Shift+D',
+  activeRuntimeId: null,
 };
 
 function settingsFile(): string {
@@ -38,6 +44,10 @@ export function loadSettings(): AppSettings {
         typeof raw.globalShortcutAccelerator === 'string' && raw.globalShortcutAccelerator.length > 0
           ? raw.globalShortcutAccelerator
           : DEFAULT_SETTINGS.globalShortcutAccelerator,
+      activeRuntimeId:
+        typeof raw.activeRuntimeId === 'string' && raw.activeRuntimeId.length > 0
+          ? raw.activeRuntimeId
+          : null,
     };
   } catch {
     return { ...DEFAULT_SETTINGS };

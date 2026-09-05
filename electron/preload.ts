@@ -16,6 +16,37 @@ export interface UpdateStatusView {
   message?: string;
 }
 
+/** 本地运行时条目（M6，与主进程 runtime-registry.ts 的 LocalRuntimeInfo 对应） */
+export interface LocalRuntimeView {
+  id: string;
+  dshVersion: string;
+  nodeVersion: string;
+  dir: string;
+  builtIn: boolean;
+  healthy: boolean;
+  active: boolean;
+}
+
+/** 可下载运行时条目（M6，与 runtime-updater.ts 的 RuntimeManifestEntry 对应） */
+export interface AvailableRuntimeView {
+  id: string;
+  dshVersion: string;
+  nodeVersion: string;
+  url: string;
+  sha256: string;
+  sizeBytes: number;
+}
+
+/** 运行时下载/安装进度（M6，与 RuntimeDownloadState 对应） */
+export interface RuntimeDownloadStateView {
+  phase: 'downloading' | 'extracting' | 'done' | 'error';
+  id: string;
+  percent?: number;
+  done?: number;
+  total?: number;
+  message?: string;
+}
+
 /**
  * 渲染层（设置页）可用的窄接口。
  * 主窗口加载的是 dsh Web UI，不注入任何 bridge；仅原生页面使用。
@@ -45,5 +76,28 @@ contextBridge.exposeInMainWorld('dshDesktop', {
     const listener = (_event: unknown, state: UpdateStatusView): void => callback(state);
     ipcRenderer.on('updates:state', listener);
     return () => ipcRenderer.removeListener('updates:state', listener);
+  },
+  /** 列出本地已安装的运行时（内置 + 独立下载），标记当前激活项 */
+  listLocalRuntimes: (): Promise<LocalRuntimeView[]> => ipcRenderer.invoke('runtimes:list-local'),
+  /** 拉取远端运行时清单（失败返回 { ok:false, error }） */
+  listAvailableRuntimes: (): Promise<{
+    ok: boolean;
+    runtimes?: AvailableRuntimeView[];
+    error?: string;
+  }> => ipcRenderer.invoke('runtimes:list-available'),
+  /** 启动运行时下载安装（异步任务，进度经 onRuntimeDownloadState 推送） */
+  downloadRuntime: (id: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('runtimes:download', id),
+  /** 激活运行时（null = 切回内置）；主进程会重启 dsh 并重载主窗口，失败自动回滚 */
+  activateRuntime: (id: string | null): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('runtimes:activate', id),
+  /** 删除未激活的独立运行时（内置与激活中不可删） */
+  deleteRuntime: (id: string): Promise<{ ok: boolean; error?: string }> =>
+    ipcRenderer.invoke('runtimes:delete', id),
+  /** 订阅运行时下载/安装进度；返回取消订阅函数 */
+  onRuntimeDownloadState: (callback: (state: RuntimeDownloadStateView) => void): (() => void) => {
+    const listener = (_event: unknown, state: RuntimeDownloadStateView): void => callback(state);
+    ipcRenderer.on('runtimes:download-state', listener);
+    return () => ipcRenderer.removeListener('runtimes:download-state', listener);
   },
 });

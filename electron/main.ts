@@ -8,10 +8,24 @@ import {
   nativeImage,
   Notification,
 } from 'electron';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { DshManager } from './dsh-manager';
 import { ensureRuntime, readArchiveMeta } from './runtime-setup';
+import {
+  builtinRuntimeDir,
+  runtimesRoot,
+  listLocalRuntimes,
+  resolveActiveRuntimeDir,
+  isHealthyRuntime,
+  compareDshVersions,
+} from './runtime-registry';
+import {
+  fetchRuntimeManifest,
+  downloadRuntime,
+  type RuntimeManifestEntry,
+  type RuntimeDownloadState,
+} from './runtime-updater';
 import { UpdateManager, type UpdateStatus } from './updater';
 import { Logger } from './logger';
 import { loadWindowState, saveWindowState } from './window-state';
@@ -33,7 +47,10 @@ const SMOKE_TIMEOUT_MS = 90_000;
 app.setPath('userData', join(app.getPath('appData'), 'deepseek-harness-desktop'));
 
 /** v0.1.1+：内置运行时首启解压目录（userData/runtime） */
-const RUNTIME_DIR = join(app.getPath('userData'), 'runtime');
+const RUNTIME_DIR = builtinRuntimeDir();
+
+/** M6：独立运行时安装根目录（userData/runtimes/<id>/） */
+const RUNTIMES_ROOT = runtimesRoot();
 
 let mainWindow: BrowserWindow | null = null;
 let settingsWindow: BrowserWindow | null = null;
@@ -56,9 +73,17 @@ let exitCode = 0;
 /** 正在退出以安装更新：退出流程改走 NSIS 安装器，而非 app.exit */
 let installingUpdate = false;
 
-/** dsh 进程管理器（优先使用 userData/runtime 首启解压出的内置运行时） */
+/** M6：按设置解析启动时应使用的运行时目录（激活的独立运行时 → 回退内置） */
+const initialRuntime = resolveActiveRuntimeDir(settings.activeRuntimeId);
+if (initialRuntime.fallback && settings.activeRuntimeId) {
+  logger.warn(
+    `激活的运行时 ${settings.activeRuntimeId} 不可用，本次启动回退内置运行时`
+  );
+}
+
+/** dsh 进程管理器（优先使用激活的独立运行时，默认内置 userData/runtime） */
 const dsh = new DshManager({
-  runtimeDir: RUNTIME_DIR,
+  runtimeDir: initialRuntime.dir,
   events: {
     onLog: (line) => logger.info(`[dsh] ${line}`),
     onCrash: (code) => {
@@ -351,8 +376,10 @@ function openSettingsWindow(): void {
   }
   const win = new BrowserWindow({
     width: 560,
-    height: 560,
-    resizable: false,
+    height: 640,
+    resizable: true,
+    minWidth: 480,
+    minHeight: 520,
     maximizable: false,
     title: '设置',
     backgroundColor: '#0f1117',
@@ -383,6 +410,9 @@ ipcMain.handle('settings:set', (_event, incoming: Partial<AppSettings>) => {
       typeof incoming.globalShortcutAccelerator === 'string' && incoming.globalShortcutAccelerator.length > 0
         ? incoming.globalShortcutAccelerator
         : 'Control+Shift+D',
+    // 运行时激活由专门的 runtimes:activate IPC 维护（涉及 dsh 重启与回滚），
+    // 设置页普通保存不触碰该字段
+    activeRuntimeId: settings.activeRuntimeId,
   };
   saveSettings(settings);
   applyLoginItem();
@@ -392,6 +422,148 @@ ipcMain.handle('settings:set', (_event, incoming: Partial<AppSettings>) => {
 
 ipcMain.handle('app:open-logs', () => {
   void shell.openPath(logger.logDir);
+});
+
+// ---------- 运行时管理（M6：独立下载/切换/回滚 dsh 运行时） ----------
+
+/** manifest 缓存（list-available 拉取后供 download 复用；不做磁盘持久化） */
+let availableRuntimes: RuntimeManifestEntry[] = [];
+
+/** 下载任务互斥（同一时间只允许一个运行时下载安装） */
+let runtimeDownloadBusy = false;
+
+/** 下载进度推送节流 */
+let lastRuntimeStatePush = 0;
+
+/** 把下载/安装进度转发给设置窗口（打开时才推） */
+function pushRuntimeState(state: RuntimeDownloadState): void {
+  const now = Date.now();
+  const isEnd = state.phase === 'done' || state.phase === 'error';
+  if (!isEnd && now - lastRuntimeStatePush < 250) return; // 节流：≤4 次/秒
+  lastRuntimeStatePush = now;
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send('runtimes:download-state', state);
+  }
+}
+
+ipcMain.handle('runtimes:list-local', () => listLocalRuntimes(settings.activeRuntimeId));
+
+ipcMain.handle('runtimes:list-available', async () => {
+  try {
+    const runtimes = await fetchRuntimeManifest();
+    availableRuntimes = runtimes;
+    // 新版本排前（设置页直接按序渲染）
+    runtimes.sort((a, b) => compareDshVersions(b.dshVersion, a.dshVersion));
+    return { ok: true, runtimes };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`拉取运行时清单失败：${msg}`);
+    return { ok: false, error: msg };
+  }
+});
+
+ipcMain.handle('runtimes:download', (_event, id: unknown) => {
+  if (typeof id !== 'string' || id.length === 0) return { ok: false, error: '参数错误' };
+  if (runtimeDownloadBusy) return { ok: false, error: '已有运行时下载任务进行中，请稍候' };
+  const entry = availableRuntimes.find((r) => r.id === id || r.dshVersion === id);
+  if (!entry) return { ok: false, error: `清单中不存在运行时 ${id}，请刷新可用列表后重试` };
+  if (isHealthyRuntime(join(RUNTIMES_ROOT, entry.id))) {
+    return { ok: false, error: '该运行时已安装' };
+  }
+
+  runtimeDownloadBusy = true;
+  logger.info(`开始下载运行时：dsh ${entry.dshVersion}（${(entry.sizeBytes / 1024 / 1024).toFixed(0)} MB）`);
+  void downloadRuntime({
+    entry,
+    targetRoot: RUNTIMES_ROOT,
+    onState: (s) => {
+      pushRuntimeState(s);
+      if (s.phase === 'extracting' && s.done === 1) {
+        logger.info(`运行时 ${entry.dshVersion} 下载完成，开始解压 …`);
+      }
+    },
+  })
+    .then(() => logger.info(`运行时安装完成：dsh ${entry.dshVersion}（id=${entry.id}）`))
+    .catch((err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error(`运行时下载/安装失败：${msg}`);
+      pushRuntimeState({ phase: 'error', id: entry.id, message: msg });
+    })
+    .finally(() => {
+      runtimeDownloadBusy = false;
+    });
+  return { ok: true };
+});
+
+/** 激活运行时（null = 切回内置）：停 dsh → 换目录 → 起 dsh → 重载窗口；失败自动回滚 */
+async function activateRuntime(id: string | null): Promise<{ ok: boolean; error?: string }> {
+  if (id === settings.activeRuntimeId) return { ok: true }; // 无变化
+  const targetDir = id ? join(RUNTIMES_ROOT, id) : RUNTIME_DIR;
+  if (id && !isHealthyRuntime(targetDir)) {
+    return { ok: false, error: '运行时不完整或已被删除，请重新下载安装' };
+  }
+  const prevId = settings.activeRuntimeId;
+  const prevDir = prevId ? join(RUNTIMES_ROOT, prevId) : RUNTIME_DIR;
+  const win = mainWindow;
+  logger.info(`切换运行时：${prevId ?? '内置'} → ${id ?? '内置'}`);
+
+  try {
+    if (win && !win.isDestroyed()) {
+      await win.loadFile(join(__dirname, '..', 'renderer', 'loading.html'));
+    }
+    await dsh.stop();
+    dsh.setRuntimeDir(targetDir);
+    settings.activeRuntimeId = id;
+    saveSettings(settings);
+    const port = await dsh.start();
+    logger.info(`运行时切换完成，dsh 端口 ${port}`);
+    if (win && !win.isDestroyed()) {
+      await win.loadURL(`http://127.0.0.1:${port}`);
+    }
+    return { ok: true };
+  } catch (err) {
+    // 回滚：恢复原运行时并重启 dsh；连回滚都失败才显示错误页
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`切换运行时失败：${msg}，回滚到 ${prevId ?? '内置'}`);
+    settings.activeRuntimeId = prevId;
+    saveSettings(settings);
+    dsh.setRuntimeDir(prevDir);
+    try {
+      await dsh.stop();
+      const port = await dsh.start();
+      if (win && !win.isDestroyed()) {
+        await win.loadURL(`http://127.0.0.1:${port}`);
+      }
+    } catch (rollbackErr) {
+      const rmsg = rollbackErr instanceof Error ? rollbackErr.message : String(rollbackErr);
+      logger.error(`回滚失败：${rmsg}`);
+      showFatal(`切换运行时失败且回滚失败：${msg} / ${rmsg}`);
+    }
+    return { ok: false, error: msg };
+  }
+}
+
+ipcMain.handle('runtimes:activate', (_event, id: unknown) => {
+  if (id !== null && typeof id !== 'string') return Promise.resolve({ ok: false, error: '参数错误' });
+  return activateRuntime(id as string | null);
+});
+
+ipcMain.handle('runtimes:delete', (_event, id: unknown) => {
+  if (typeof id !== 'string' || id.length === 0) return { ok: false, error: '参数错误' };
+  if (settings.activeRuntimeId === id) {
+    return { ok: false, error: '不能删除正在使用的运行时，请先切换到其他运行时' };
+  }
+  const dir = join(RUNTIMES_ROOT, id);
+  if (!existsSync(dir)) return { ok: false, error: '运行时不存在' };
+  try {
+    rmSync(dir, { recursive: true, force: true });
+    logger.info(`已删除运行时：${id}`);
+    return { ok: true };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.error(`删除运行时失败：${msg}`);
+    return { ok: false, error: msg };
+  }
 });
 
 // ---------- 设置项应用 ----------

@@ -52,6 +52,46 @@
     #status.ok { color: #67c23a; }
     #status.err { color: #f56c6c; }
     .accel-hint { font-size: 12px; color: #7c8296; margin-top: 6px; }
+    /* 运行时管理（M6） */
+    .runtime-details {
+      border: 1px solid #2a2d38; border-radius: 10px; background: #161923;
+      margin-bottom: 12px; padding: 0 16px;
+    }
+    .runtime-details summary {
+      cursor: pointer; padding: 14px 0; font-size: 14px; user-select: none;
+    }
+    .runtime-details[open] summary { border-bottom: 1px solid #2a2d38; }
+    .rt-subtitle {
+      font-size: 12px; color: #7c8296; margin: 12px 0 6px;
+      display: flex; align-items: center; gap: 8px;
+    }
+    .rt-row {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 8px 0; border-bottom: 1px solid #20232e;
+    }
+    .rt-row:last-child { border-bottom: none; }
+    .rt-row .label { display: flex; flex-direction: column; gap: 2px; }
+    .rt-row .label .title { font-size: 13px; }
+    .rt-row .label .hint { font-size: 11px; color: #7c8296; }
+    .rt-ops { display: flex; align-items: center; gap: 12px; }
+    .rt-badge {
+      font-size: 11px; padding: 2px 8px; border-radius: 9px; flex: none;
+      background: #2a2d38; color: #a8adbd;
+    }
+    .rt-badge-active { background: #1d3a22; color: #67c23a; }
+    .rt-badge-bad { background: #3a1d1d; color: #f56c6c; }
+    .rt-empty { font-size: 12px; color: #7c8296; padding: 6px 0; }
+    .rt-empty.rt-error { color: #f56c6c; }
+    .rt-danger { color: #f56c6c; }
+    .rt-progress { margin: 12px 0 16px; }
+    .rt-progress-label { font-size: 12px; color: #a8adbd; margin-bottom: 6px; }
+    .rt-progress-bar {
+      height: 6px; border-radius: 3px; background: #2a2d38; overflow: hidden;
+    }
+    .rt-progress-fill {
+      height: 100%; width: 0; border-radius: 3px; background: #3d5cf4;
+      transition: width 0.2s;
+    }
   </style>
 </head>
 <body>
@@ -88,6 +128,21 @@
       </div>
     </div>
     <div class="accel-hint">快捷键写法：Control+Shift+D、Alt+D、CommandOrControl+J 等（Electron accelerator 格式）</div>
+
+    <details id="runtimeSection" class="runtime-details">
+      <summary>运行时管理（dsh 版本独立升级 / 回滚）</summary>
+      <div class="rt-subtitle">本地运行时</div>
+      <div id="localRuntimes"></div>
+      <div class="rt-subtitle">
+        可下载版本
+        <button class="link" id="refreshRuntimes" style="margin-top:0">刷新</button>
+      </div>
+      <div id="availableRuntimes"></div>
+      <div class="rt-progress" id="runtimeProgress" style="display:none">
+        <div class="rt-progress-label" id="runtimeProgressLabel"></div>
+        <div class="rt-progress-bar"><div class="rt-progress-fill" id="runtimeProgressFill"></div></div>
+      </div>
+    </details>
 
     <div class="row">
       <div class="label">
@@ -203,6 +258,197 @@
       const result = await api.installUpdate();
       if (!result.ok) updateStatus.textContent = result.error ?? '安装失败';
     });
+
+    // ---------- 运行时管理（M6） ----------
+
+    const localRtList = $('localRuntimes');
+    const availableRtList = $('availableRuntimes');
+    const rtProgress = $('runtimeProgress');
+    const rtProgressLabel = $('runtimeProgressLabel');
+    const rtProgressFill = $('runtimeProgressFill');
+    let localRuntimesCache = [];
+    let availableRuntimesCache = [];
+
+    function rtRow(title, hint) {
+      const row = document.createElement('div');
+      row.className = 'rt-row';
+      const left = document.createElement('div');
+      left.className = 'label';
+      const t = document.createElement('span');
+      t.className = 'title';
+      t.textContent = title;
+      const h = document.createElement('span');
+      h.className = 'hint';
+      h.textContent = hint;
+      left.append(t, h);
+      const ops = document.createElement('div');
+      ops.className = 'rt-ops';
+      row.append(left, ops);
+      return { row, ops };
+    }
+
+    function rtBadge(text, cls) {
+      const b = document.createElement('span');
+      b.className = `rt-badge ${cls ?? ''}`;
+      b.textContent = text;
+      return b;
+    }
+
+    function rtButton(text, onClick, danger) {
+      const btn = document.createElement('button');
+      btn.className = 'link';
+      btn.style.marginTop = '0';
+      if (danger) btn.classList.add('rt-danger');
+      btn.textContent = text;
+      btn.addEventListener('click', () => void onClick());
+      return btn;
+    }
+
+    function renderLocalRuntimes() {
+      localRtList.innerHTML = '';
+      if (localRuntimesCache.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'rt-empty';
+        empty.textContent = '暂无本地运行时';
+        localRtList.append(empty);
+        return;
+      }
+      for (const rt of localRuntimesCache) {
+        const hint = rt.builtIn
+          ? `应用内置${rt.nodeVersion ? ` · Node ${rt.nodeVersion}` : ''}`
+          : rt.nodeVersion
+            ? `Node ${rt.nodeVersion}`
+            : rt.id;
+        const { row, ops } = rtRow(`dsh ${rt.dshVersion || '未知版本'}`, hint);
+        if (rt.active) {
+          ops.append(rtBadge('使用中', 'rt-badge-active'));
+        } else if (rt.healthy) {
+          ops.append(rtButton('使用', () => activateRuntime(rt)));
+        } else {
+          ops.append(rtBadge('已损坏', 'rt-badge-bad'));
+        }
+        if (!rt.builtIn && !rt.active) {
+          ops.append(rtButton('删除', () => deleteRuntime(rt), true));
+        }
+        localRtList.append(row);
+      }
+    }
+
+    function renderAvailableRuntimes() {
+      availableRtList.innerHTML = '';
+      if (availableRuntimesCache.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'rt-empty';
+        empty.textContent = '暂无可下载版本';
+        availableRtList.append(empty);
+        return;
+      }
+      for (const rt of availableRuntimesCache) {
+        const installed = localRuntimesCache.some((l) => l.id === rt.id);
+        const { row, ops } = rtRow(
+          `dsh ${rt.dshVersion}`,
+          `Node ${rt.nodeVersion || '—'} · ${(rt.sizeBytes / 1024 / 1024).toFixed(0)} MB`
+        );
+        if (installed) {
+          ops.append(rtBadge('已安装'));
+        } else {
+          ops.append(rtButton('下载并安装', () => startRuntimeDownload(rt)));
+        }
+        availableRtList.append(row);
+      }
+    }
+
+    async function refreshLocalRuntimes() {
+      localRuntimesCache = await api.listLocalRuntimes();
+      renderLocalRuntimes();
+      renderAvailableRuntimes(); // 同步"已安装"徽标
+    }
+
+    async function refreshAvailableRuntimes() {
+      availableRtList.innerHTML = '';
+      const loading = document.createElement('div');
+      loading.className = 'rt-empty';
+      loading.textContent = '正在获取可用版本…';
+      availableRtList.append(loading);
+      const res = await api.listAvailableRuntimes();
+      if (!res.ok) {
+        availableRtList.innerHTML = '';
+        const err = document.createElement('div');
+        err.className = 'rt-empty rt-error';
+        err.textContent = `获取失败：${res.error ?? '未知错误'}`;
+        availableRtList.append(err);
+        return;
+      }
+      availableRuntimesCache = res.runtimes ?? [];
+      renderAvailableRuntimes();
+    }
+
+    async function activateRuntime(rt) {
+      rtProgress.style.display = 'block';
+      rtProgressLabel.textContent = `正在切换到 dsh ${rt.dshVersion}（服务重启中）…`;
+      rtProgressFill.style.width = '100%';
+      const result = await api.activateRuntime(rt.builtIn ? null : rt.id);
+      rtProgress.style.display = 'none';
+      if (result.ok) {
+        showStatus(true, `已切换到 dsh ${rt.dshVersion}`);
+      } else {
+        showStatus(false, `切换失败：${result.error ?? '未知错误'}`);
+      }
+      await refreshLocalRuntimes();
+    }
+
+    async function deleteRuntime(rt) {
+      const result = await api.deleteRuntime(rt.id);
+      if (result.ok) {
+        showStatus(true, `已删除 dsh ${rt.dshVersion}`);
+      } else {
+        showStatus(false, `删除失败：${result.error ?? '未知错误'}`);
+      }
+      await refreshLocalRuntimes();
+    }
+
+    async function startRuntimeDownload(rt) {
+      const result = await api.downloadRuntime(rt.id);
+      if (!result.ok) {
+        showStatus(false, result.error ?? '无法开始下载');
+        return;
+      }
+      rtProgress.style.display = 'block';
+      rtProgressLabel.textContent = `下载 dsh ${rt.dshVersion} …`;
+      rtProgressFill.style.width = '0%';
+    }
+
+    api.onRuntimeDownloadState((state) => {
+      rtProgress.style.display = 'block';
+      if (state.phase === 'downloading') {
+        const pct = state.percent ?? 0;
+        rtProgressLabel.textContent = `下载运行时 … ${pct}%`;
+        rtProgressFill.style.width = `${pct}%`;
+      } else if (state.phase === 'extracting') {
+        const pct = state.total ? Math.floor((state.done / state.total) * 100) : 0;
+        rtProgressLabel.textContent = `解压安装中 … ${pct}%`;
+        rtProgressFill.style.width = `${pct}%`;
+      } else if (state.phase === 'done') {
+        rtProgressLabel.textContent = '安装完成';
+        rtProgressFill.style.width = '100%';
+        setTimeout(() => {
+          rtProgress.style.display = 'none';
+        }, 1500);
+        void refreshLocalRuntimes();
+      } else if (state.phase === 'error') {
+        rtProgressLabel.textContent = `安装失败：${state.message ?? '未知错误'}`;
+        rtProgressFill.style.width = '0%';
+        showStatus(false, `运行时安装失败：${state.message ?? ''}`);
+      }
+    });
+
+    $('refreshRuntimes').addEventListener('click', () => {
+      void refreshLocalRuntimes();
+      void refreshAvailableRuntimes();
+    });
+
+    void refreshLocalRuntimes();
+    void refreshAvailableRuntimes();
 
     void initUpdateSection();
     void load();

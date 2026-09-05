@@ -279,6 +279,8 @@ function sha256File(p) {
 
 async function main() {
   log(`目标：dsh ${DSH_VERSION}，工作区 ${RUNTIME_DIR}，输出 ${OUT_DIR}`);
+  // --out 指定的目录可能不存在（本地分包构建 / CI），先建好避免写 tar 时 ENOENT
+  mkdirSync(OUT_DIR, { recursive: true });
   if (force && existsSync(RUNTIME_DIR)) {
     log('--force：删除现有工作区 …');
     rmSync(RUNTIME_DIR, { recursive: true, force: true });
